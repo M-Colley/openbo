@@ -237,11 +237,14 @@ def main() -> None:
             noise_std=noise_std,
             cap_at_optimum=cap_at_optimum,
         )
-        family = build_specs(
-            base_name=args.base_function,
-            variants=variants,
-            prefix=f"{args.base_function}_variant",
-        )
+        def _build_family():
+            return build_specs(
+                base_name=args.base_function,
+                variants=variants,
+                prefix=f"{args.base_function}_variant",
+            )
+
+        family = _build_family()
         eval_variants = variants
     else:
         split = load_family_split(args.split_path)
@@ -262,16 +265,25 @@ def main() -> None:
                 replace(v, noise_std=0.05, cap_at_optimum=True) for v in chosen_variants
             ]
         if args.subset == "train":
-            family = build_specs(split.base_name, chosen_variants, prefix="train_task")
-            eval_variants = chosen_variants
+            def _build_family():
+                return build_specs(split.base_name, chosen_variants, prefix="train_task")
         elif args.subset == "test":
-            family = build_specs(split.base_name, chosen_variants, prefix="test_task")
-            eval_variants = chosen_variants
+            def _build_family():
+                return build_specs(split.base_name, chosen_variants, prefix="test_task")
         else:
             n_train = len(split.train_variants)
-            family = build_specs(split.base_name, chosen_variants[:n_train], prefix="train_task")
-            family += build_specs(split.base_name, chosen_variants[n_train:], prefix="test_task")
-            eval_variants = chosen_variants
+
+            def _build_family():
+                fam = build_specs(
+                    split.base_name, chosen_variants[:n_train], prefix="train_task"
+                )
+                fam += build_specs(
+                    split.base_name, chosen_variants[n_train:], prefix="test_task"
+                )
+                return fam
+
+        family = _build_family()
+        eval_variants = chosen_variants
         source_meta_map = {
             f"train_task_{idx:03d}": _variant_meta_features(variant)
             for idx, variant in enumerate(split.train_variants)
@@ -323,6 +335,11 @@ def main() -> None:
     subset_tag = args.subset if args.split_path is not None else "all"
 
     for taf_mode in taf_modes:
+        # Rebuild the family so each mode gets fresh objective closures with
+        # freshly seeded noise RNGs. Otherwise a prior mode advances the shared
+        # per-task noise stream and --taf-weight-modes comparisons become
+        # order-dependent (and unfair) under --noisy.
+        family = _build_family()
         final_bests: list[float] = []
         run_dir_name = f"{args.test_id}_{args.method}_{args.base_function}_{subset_tag}"
         if args.method in {"bo_taf", "bo_taf_m", "bo_taf_r"}:

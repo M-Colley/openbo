@@ -44,7 +44,12 @@ class BoTorchSequentialOptimizer:
     def __init__(self, config: BoTorchConfig) -> None:
         self.config = config
         self.rng = np.random.default_rng(config.seed)
-        torch.manual_seed(0 if config.seed is None else config.seed)
+        # torch seeding is scoped inside suggest() via fork_rng so it never mutates
+        # the process-global CPU torch RNG (which would let concurrent server
+        # sessions perturb each other). Everything here is CPU double precision.
+        # A None seed stays nondeterministic rather than being silently pinned to 0.
+        self._torch_seed = config.seed
+        self._suggest_calls = 0
 
         self.d = len(config.bounds)
         self.lower = np.array([b[0] for b in config.bounds], dtype=np.float64)
@@ -77,23 +82,37 @@ class BoTorchSequentialOptimizer:
         x_obs_unit = (self.x_obs - self.lower) / self.scale
         train_x = torch.tensor(x_obs_unit, dtype=torch.double)
         train_y = torch.tensor(self.y_obs, dtype=torch.double).unsqueeze(-1)
-        model = SingleTaskGP(train_x, train_y, outcome_transform=Standardize(m=1))
-        mll = ExactMarginalLogLikelihood(model.likelihood, model)
-        fit_gpytorch_mll(mll)
-
-        best_f = torch.max(train_y).item()
-        acq = LogExpectedImprovement(model=model, best_f=best_f)
         bounds_t = torch.tensor(
             np.array([[0.0] * self.d, [1.0] * self.d], dtype=np.float64),
             dtype=torch.double,
         )
-        candidate, _ = optimize_acqf(
-            acq_function=acq,
-            bounds=bounds_t,
-            q=1,
-            num_restarts=self.config.num_restarts,
-            raw_samples=self.config.raw_samples,
-        )
+        # Isolate torch RNG use to this call: fork_rng saves/restores the CPU
+        # generator, and a per-call seed (base + call index) keeps runs reproducible
+        # and each iteration distinct without leaking into other sessions.
+        # Seed default_generator directly rather than torch.manual_seed: the latter
+        # also reseeds every accelerator (CUDA/MPS/XPU) generator, which
+        # fork_rng(devices=[]) does not restore, so it would clobber the global
+        # accelerator RNG of any co-hosted torch code. The CPU stream is identical.
+        with torch.random.fork_rng(devices=[]):
+            if self._torch_seed is not None:
+                torch.default_generator.manual_seed(
+                    int(self._torch_seed) + self._suggest_calls
+                )
+            self._suggest_calls += 1
+
+            model = SingleTaskGP(train_x, train_y, outcome_transform=Standardize(m=1))
+            mll = ExactMarginalLogLikelihood(model.likelihood, model)
+            fit_gpytorch_mll(mll)
+
+            best_f = torch.max(train_y).item()
+            acq = LogExpectedImprovement(model=model, best_f=best_f)
+            candidate, _ = optimize_acqf(
+                acq_function=acq,
+                bounds=bounds_t,
+                q=1,
+                num_restarts=self.config.num_restarts,
+                raw_samples=self.config.raw_samples,
+            )
         x_next_unit = candidate.detach().cpu().numpy().astype(np.float64)
         return x_next_unit * self.scale + self.lower
 
