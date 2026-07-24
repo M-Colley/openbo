@@ -38,8 +38,19 @@ class GPScratch:
             raise ValueError("x must have shape (n, d).")
         if self.y_train.ndim != 1 or self.y_train.shape[0] != self.x_train.shape[0]:
             raise ValueError("y must have shape (n,) and match x rows.")
+        if self.x_train.shape[0] == 0:
+            raise ValueError("need at least one training point to fit the GP.")
+
+        # Preserve the user's original lengthscale config so re-fitting the same
+        # instance on data of a different dimensionality re-resolves from it,
+        # instead of tripping over a stale ARD vector from a previous fit.
+        if not hasattr(self, "_lengthscale_config"):
+            self._lengthscale_config = self.lengthscale
 
         d = self.x_train.shape[1]
+        stale = np.asarray(self.lengthscale, dtype=np.float64)
+        if stale.ndim == 1 and stale.shape[0] != d:
+            self.lengthscale = self._lengthscale_config
         self.lengthscale = self._resolve_lengthscale(d)
         self._set_target_scaling()
 
@@ -76,7 +87,12 @@ class GPScratch:
     def _set_target_scaling(self) -> None:
         if self.standardize_targets:
             self.y_mean = float(np.mean(self.y_train))
-            self.y_std = float(np.std(self.y_train) + 1e-12)
+            raw_std = float(np.std(self.y_train))
+            # Floor a (near-)zero spread to 1.0 rather than adding a tiny epsilon.
+            # For n=1 or constant targets np.std is 0, and the old `std + 1e-12`
+            # made y_std ~1e-12, so posterior var = var_norm * y_std**2 ~ 1e-24
+            # collapsed uncertainty to ~0 everywhere (default config, e.g. n_init=1).
+            self.y_std = raw_std if raw_std > 1e-8 else 1.0
             self.y_train_norm = ((self.y_train - self.y_mean) / self.y_std).astype(
                 np.float64
             )

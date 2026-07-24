@@ -129,21 +129,50 @@ def test_compute_taf_m_weights_shape() -> None:
     assert weights[0] >= weights[1]
 
 
-def test_compute_taf_r_weights_shape_and_range() -> None:
-    """TAF-R weights should be one scalar per source in [0, 0.75]."""
+def test_compute_taf_r_weights_normalized() -> None:
+    """TAF-R weights are non-negative, normalized to sum 1, and zero for an
+    uninformative (constant) source."""
     x_train = np.array([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]], dtype=np.float64)
     y_train = np.array([-1.0, 0.2, 0.1], dtype=np.float64)
-    gp = GPScratch(optimize_hyperparameters=False)
-    gp.fit(x_train, y_train)
-    source = SourceTaskSurrogate(
-        name="src0",
-        gp=gp,
-        best_y=float(np.max(y_train)),
+
+    gp_agree = GPScratch(optimize_hyperparameters=False)
+    gp_agree.fit(x_train, y_train)  # reproduces the target ranking
+    gp_const = GPScratch(optimize_hyperparameters=False)
+    gp_const.fit(x_train, np.zeros_like(y_train))  # flat -> no ranking information
+
+    src_agree = SourceTaskSurrogate(
+        name="agree", gp=gp_agree, best_y=float(np.max(y_train)),
         meta_features=np.array([0.0, 0.0], dtype=np.float64),
     )
-    weights = compute_taf_r_weights([source], x_train, y_train, rho=1.0)
-    assert weights.shape == (1,)
-    assert 0.0 <= float(weights[0]) <= 0.75
+    src_const = SourceTaskSurrogate(
+        name="const", gp=gp_const, best_y=0.0,
+        meta_features=np.array([0.0, 0.0], dtype=np.float64),
+    )
+
+    weights = compute_taf_r_weights([src_agree, src_const], x_train, y_train, rho=1.0)
+    assert weights.shape == (2,)
+    assert np.all(weights >= 0.0)
+    assert np.isclose(weights.sum(), 1.0)
+    # The agreeing source takes the weight; the constant source has no comparable
+    # pairs and must get zero (not the maximum a distance of 0.0 would imply).
+    assert weights[0] > weights[1]
+    assert np.isclose(weights[1], 0.0)
+
+
+def test_compute_taf_r_weights_few_observations_uniform() -> None:
+    """With <2 observations TAF-R returns a normalized uniform distribution."""
+    x_train = np.array([[0.2, 0.3]], dtype=np.float64)
+    y_train = np.array([0.5], dtype=np.float64)
+    gp = GPScratch(optimize_hyperparameters=False)
+    gp.fit(np.array([[0.0, 0.0], [1.0, 1.0]]), np.array([0.0, 1.0]))
+    sources = [
+        SourceTaskSurrogate(name=f"s{i}", gp=gp, best_y=1.0,
+                            meta_features=np.array([0.0, 0.0], dtype=np.float64))
+        for i in range(3)
+    ]
+    weights = compute_taf_r_weights(sources, x_train, y_train, rho=1.0)
+    assert weights.shape == (3,)
+    assert np.allclose(weights, 1.0 / 3.0)
 
 
 def test_taf_m_acquisition_single_and_batch() -> None:

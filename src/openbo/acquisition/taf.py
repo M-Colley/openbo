@@ -92,10 +92,13 @@ def compute_taf_r_weights(
 
     n_sources = len(source_surrogates)
     n = y_obs.shape[0]
+    eps = 1e-12
     if n_sources == 0:
         return np.zeros(0, dtype=np.float64)
+    # With <2 observations there is no ranking evidence yet; fall back to a
+    # uniform distribution (normalized, matching compute_taf_m_weights' contract).
     if n < 2:
-        return np.ones(n_sources, dtype=np.float64)
+        return np.ones(n_sources, dtype=np.float64) / n_sources
 
     weights: list[float] = []
     for source in source_surrogates:
@@ -111,9 +114,26 @@ def compute_taf_r_weights(
                 if (target_diff > 0.0) != (source_diff > 0.0):
                     disagreements += 1
                 total += 1
-        distance = 0.0 if total == 0 else float(disagreements / total)
+        if total == 0:
+            # No comparable pairs => the source carries no ranking information
+            # about the target, so it gets zero weight (not the max weight that a
+            # distance of 0.0 would otherwise imply).
+            weights.append(0.0)
+            continue
+        distance = float(disagreements / total)
         weights.append(epanechnikov_weight(distance, rho))
-    return np.asarray(weights, dtype=np.float64)
+
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    total_weight = float(weights_arr.sum())
+    # If every source's predicted ranking disagrees with the observed target
+    # ranking beyond the bandwidth (all weights underflow), return zeros so
+    # taf_m_acquisition falls back to target-only EI instead of re-injecting
+    # sources that provably contradict the observations at uniform weight. (The
+    # n<2 uniform prior above stays: with too few observations there is no
+    # disagreement evidence yet.)
+    if total_weight <= eps:
+        return np.zeros(n_sources, dtype=np.float64)
+    return weights_arr / total_weight
 
 
 def taf_m_acquisition(
@@ -177,7 +197,11 @@ def taf_m_acquisition(
         elif source_improvement_mode == "softplus":
             tau = float(max(source_improvement_temperature, 1e-12))
             # Smooth non-negative approximation of ReLU to reduce sparsity.
-            source_imp = tau * np.log1p(np.exp(delta / tau))
+            # Numerically stable softplus: tau*log1p(exp(z)) == tau*(max(z,0) +
+            # log1p(exp(-|z|))). The naive form overflows to +inf once z=delta/tau
+            # exceeds ~709 (delta>~35 for tau=0.05), which poisons the acquisition.
+            z = delta / tau
+            source_imp = tau * (np.maximum(z, 0.0) + np.log1p(np.exp(-np.abs(z))))
         else:
             raise ValueError(
                 "source_improvement_mode must be 'relu' or 'softplus'."

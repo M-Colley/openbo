@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -104,27 +105,45 @@ def _load_source_surrogates(taf_run_dir: str | Path) -> list[SourceTaskSurrogate
     for gp_path in gp_files:
         task_name = gp_path.stem
         traj_path = trajectories_dir / f"{task_name}.json"
-        
+
         if not traj_path.exists():
+            warnings.warn(
+                f"TAF source '{task_name}': missing trajectory file {traj_path}; "
+                "skipping this source."
+            )
             continue
-        gp_payload = json.loads(gp_path.read_text(encoding="utf-8"))
-        traj_payload = json.loads(traj_path.read_text(encoding="utf-8"))
-        gp_state = gp_payload.get("gp_state")
-        if not isinstance(gp_state, dict):
+        try:
+            gp_payload = json.loads(gp_path.read_text(encoding="utf-8"))
+            traj_payload = json.loads(traj_path.read_text(encoding="utf-8"))
+            gp_state = gp_payload.get("gp_state")
+            if not isinstance(gp_state, dict):
+                warnings.warn(
+                    f"TAF source '{task_name}': gp_state missing or not an object; "
+                    "skipping this source."
+                )
+                continue
+
+            x_values = np.asarray(traj_payload["x_values"], dtype=np.float64)
+            y_values = np.asarray(traj_payload["y_values"], dtype=np.float64)
+            gp = GPScratch(
+                lengthscale=np.asarray(gp_state["lengthscale"], dtype=np.float64),
+                variance=float(gp_state["variance"]),
+                noise=float(gp_state["noise"]),
+                kernel_type=str(gp_state["kernel_type"]),
+                optimize_hyperparameters=False,
+                standardize_targets=bool(gp_state.get("standardize_targets", True)),
+                optimize_noise=bool(gp_state.get("optimize_noise", False)),
+            )
+            gp.fit(x_values, y_values)
+        except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            # A present-but-malformed file is treated the same as a missing one
+            # (warn + skip) instead of raising an opaque KeyError mid-load.
+            warnings.warn(
+                f"TAF source '{task_name}': malformed artifacts ({exc!r}); "
+                "skipping this source."
+            )
             continue
 
-        x_values = np.asarray(traj_payload["x_values"], dtype=np.float64)
-        y_values = np.asarray(traj_payload["y_values"], dtype=np.float64)
-        gp = GPScratch(
-            lengthscale=np.asarray(gp_state["lengthscale"], dtype=np.float64),
-            variance=float(gp_state["variance"]),
-            noise=float(gp_state["noise"]),
-            kernel_type=str(gp_state["kernel_type"]),
-            optimize_hyperparameters=False,
-            standardize_targets=bool(gp_state.get("standardize_targets", True)),
-            optimize_noise=bool(gp_state.get("optimize_noise", False)),
-        )
-        gp.fit(x_values, y_values)
         surrogates.append(
             SourceTaskSurrogate(
                 name=task_name,
@@ -259,10 +278,25 @@ class TAFSequentialOptimizer:
         self.y_obs = np.empty((0,), dtype=np.float64)
         self.best_y_history: list[float] = []
         self.iter_count = 0
+        # Number of suggest() calls made so far. Drives the source-only warmup
+        # window independently of iter_count, which bootstrap() pre-increments
+        # when n_init > 0 (that coupling made the warmup off-by-one).
+        self.n_suggestions = 0
         self.pending_x: NDArray[np.float64] | None = None
 
         self.source_surrogates = _load_source_surrogates(config.taf_run_dir)
         source_meta_map = _normalize_meta_map(config.source_meta_features)
+        if source_meta_map:
+            # Overriding only SOME sources leaves meta vectors of mixed length,
+            # which fails later with an opaque ragged np.stack error (or, with an
+            # explicit target meta, a dimension mismatch). Fail fast and say why.
+            missing = [s.name for s in self.source_surrogates if s.name not in source_meta_map]
+            if missing:
+                raise ValueError(
+                    "source_meta_features must cover every source surrogate; no entry "
+                    f"for {missing}. Provide meta-features for all sources or pass "
+                    "source_meta_features=None to use the built-in defaults."
+                )
         for source in self.source_surrogates:
             if source.name in source_meta_map:
                 source.meta_features = source_meta_map[source.name]
@@ -305,18 +339,22 @@ class TAFSequentialOptimizer:
             raise ValueError("No iterations remaining.")
 
         iter_idx = self.iter_count
-        source_only_phase = iter_idx < int(max(self.config.source_only_warmup_iters, 0))
+        suggest_idx = self.n_suggestions
+        self.n_suggestions += 1
+        # Stay source-only while inside the warmup window, OR whenever there are no
+        # target observations yet (the target GP cannot be fit without data). The
+        # latter also prevents a deadlock when n_init == 0 and warmup == 0.
+        source_only_phase = (
+            suggest_idx < int(max(self.config.source_only_warmup_iters, 0))
+            or self.y_obs.size == 0
+        )
         if source_only_phase:
             target_gp_eval: GPScratch | None = None
             target_weight_eval = 0.0
-            target_best_y = float("-inf") if iter_idx == 0 else (
+            target_best_y = (
                 float(np.max(self.y_obs)) if self.y_obs.size > 0 else float("-inf")
             )
         else:
-            if self.y_obs.size == 0:
-                raise ValueError(
-                    "No target observations available when leaving source-only warmup."
-                )
             self.target_gp.fit(self.x_obs, self.y_obs)
             target_gp_eval = self.target_gp
             target_weight_eval = float(self.config.target_weight)
