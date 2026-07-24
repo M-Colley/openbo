@@ -813,7 +813,7 @@ Set `taf_run_dir` in your TAF server YAML to the **same** directory you used for
 with:
 
 ```yaml
-taf_run_dir: meta-bo-training/branin_server_end_to_end
+taf_run_dir: meta-bo-training/taf-gps/branin_server_end_to_end
 ```
 
 Start the TAF server on a **different** port if you will run it on the same machine
@@ -889,7 +889,7 @@ uv run python server_scripts/plot_manual_family_trajectories.py \
 ```bash
 uv run python server_scripts/plot_manual_family_trajectories.py \
   --split-path configs/family_splits/branin_split_15.json \
-  --train-trajectories-dir meta-bo-training/branin_server_end_to_end/trajectories \
+  --train-trajectories-dir meta-bo-training/taf-gps/branin_server_end_to_end/trajectories \
   --test-results-dir test_results/branin_server_end_to_end/test_sessions \
   --plot-mode per_task \
   --output test_results/manual_family/log_regret_per_task.png
@@ -986,7 +986,7 @@ We thoroughly compared the performance of our BO, implemented from scratch (`bo_
 - `README.md` - project overview, workflows, and command examples.
 - `pyproject.toml` - dependencies, build config, and project metadata.
 - `configs/` - YAML configs and reusable artifacts.
-  - `benchmark.yaml` - default benchmark config.
+  - `benchmark.yaml` - example benchmark config (reference only; the CLI scripts take their settings from command-line flags, not this file).
   - `methods/*.yaml` - method-level config placeholders.
   - `family_splits/*.json` - persisted train/test task-family splits.
   - `server_optimizers/*.yaml` - runtime configs for BO servers (e.g. `input_dim`, `y_range`, TAF defaults).

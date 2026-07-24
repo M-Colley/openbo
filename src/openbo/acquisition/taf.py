@@ -50,16 +50,6 @@ def compute_taf_m_weights(
     if source_meta_features.shape[1] != target_meta_features.shape[0]:
         raise ValueError("source and target meta-features must have same dimension.")
 
-    
-    #distances = np.linalg.norm(
-    #    source_meta_features - target_meta_features[None, :],
-    #    axis=1,
-    #)
-    #return np.array(
-    #    [epanechnikov_weight(float(dist), rho) for dist in distances],
-    #    dtype=np.float64,
-    #)
-    
     # Normalize meta-features before distance.
     all_features = np.vstack([source_meta_features, target_meta_features[None, :]])
     mean = np.mean(all_features, axis=0)

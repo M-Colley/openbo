@@ -307,14 +307,12 @@ class TAFSequentialOptimizer:
         iter_idx = self.iter_count
         source_only_phase = iter_idx < int(max(self.config.source_only_warmup_iters, 0))
         if source_only_phase:
-            print("source_only_phase") # FOR DEBUGGING
             target_gp_eval: GPScratch | None = None
             target_weight_eval = 0.0
             target_best_y = float("-inf") if iter_idx == 0 else (
                 float(np.max(self.y_obs)) if self.y_obs.size > 0 else float("-inf")
             )
         else:
-            print("target_phase") # FOR DEBUGGING
             if self.y_obs.size == 0:
                 raise ValueError(
                     "No target observations available when leaving source-only warmup."
@@ -333,9 +331,6 @@ class TAFSequentialOptimizer:
         else:
             target_meta = _default_meta_features(self.x_obs, self.y_obs)
 
-        print("target_meta") # FOR DEBUGGING
-        print(target_meta) # FOR DEBUGGING
-
         if self.config.taf_weight_mode == "taf_m":
             source_meta = np.stack(
                 [s.meta_features for s in self.source_surrogates], axis=0
@@ -352,9 +347,6 @@ class TAFSequentialOptimizer:
             )
         else:
             raise ValueError("taf_weight_mode must be 'taf_m' or 'taf_r'.")
-        
-        print("source_weights") # FOR DEBUGGING
-        print(source_weights) # FOR DEBUGGING
 
         if self.config.search_strategy == "multistart":
             x_pool = _sobol_in_bounds(
