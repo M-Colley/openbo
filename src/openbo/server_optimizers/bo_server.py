@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -300,6 +301,10 @@ class BOServerSession:
             if self.pending_x is None:
                 raise ValueError("No pending suggestion. Call suggest first.")
             y = float(payload["y"])
+            if not math.isfinite(y):
+                raise ValueError(
+                    f"Observed y={y} must be a finite number (got NaN/inf)."
+                )
             if y < self.y_min or y > self.y_max:
                 raise ValueError(
                     f"Observed y={y} is outside configured y_range=[{self.y_min}, {self.y_max}]."

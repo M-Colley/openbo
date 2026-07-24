@@ -287,6 +287,23 @@ def main() -> None:
             f"n_tasks={len(family)} split_path={args.split_path}"
         )
 
+    # Explicit meta-features only work when EVERY source surrogate has an entry:
+    # sources are keyed by their gp_states filename, which only matches
+    # train_task_###/test_task_### when the artifacts were produced from this same
+    # split. A partial match yields ragged meta vectors (np.stack error) and a full
+    # mismatch a dimension error, so fall back to the built-in defaults instead.
+    if source_meta_map is not None and args.taf_run_dir is not None:
+        gp_states_dir = Path(args.taf_run_dir) / "gp_states"
+        source_names = sorted(p.stem for p in gp_states_dir.glob("*.json"))
+        unmatched = [n for n in source_names if n not in source_meta_map]
+        if unmatched:
+            print(
+                "warning: ignoring split meta-features; TAF sources without a split "
+                f"entry: {unmatched[:5]}{'...' if len(unmatched) > 5 else ''}. "
+                "Falling back to default meta-features for all sources."
+            )
+            source_meta_map = None
+
     if args.taf_weight_modes is not None and args.method not in {"bo_taf", "bo_taf_m", "bo_taf_r"}:
         raise ValueError("--taf-weight-modes is supported only when --method=bo_taf.")
     taf_modes = (
@@ -315,9 +332,15 @@ def main() -> None:
 
         for idx, spec in enumerate(family):
             task_seed = args.optimizer_seed + idx
+            # Only pass an explicit target meta-feature vector when the source
+            # surrogates also carry matching meta-features (the split path builds
+            # source_meta_map). In the generated-variant path source_meta_map is
+            # None, so the sources keep their 3-dim default meta-features; passing a
+            # (2*dim+3)-dim target here would raise a dimension-mismatch ValueError
+            # inside compute_taf_m_weights. Fall back to the default target meta.
             target_meta = (
                 _variant_meta_features(eval_variants[idx])
-                if eval_variants is not None
+                if source_meta_map is not None and eval_variants is not None
                 else None
             )
             x_values, y_values = _run_one_task(
