@@ -319,7 +319,21 @@ class BOTAFServerSession:
 
             if self.init_count >= self.n_init and self.bo_count >= self.n_iter:
                 return self._done_payload()
-            return self._next_suggestion()
+            try:
+                return self._next_suggestion()
+            except Exception as exc:  # noqa: BLE001
+                # The observation is already committed; surface a recoverable error
+                # so the client retries with a 'suggest' message instead of assuming
+                # the observe was rejected (which would desync the ask/tell loop).
+                return {
+                    "type": "error",
+                    "recoverable": True,
+                    "observation_committed": True,
+                    "message": (
+                        f"observation recorded but generating the next suggestion "
+                        f"failed: {exc}. Send a 'suggest' message to retry."
+                    ),
+                }
 
         if msg_type == "status":
             return {
@@ -347,7 +361,15 @@ async def serve_bo_taf_websocket(
     """Run websocket TAF optimizer server forever."""
 
     async def _handler(websocket) -> None:
-        runtime_config = BOTAFServerRuntimeConfig.from_yaml_file(config_path)
+        try:
+            runtime_config = BOTAFServerRuntimeConfig.from_yaml_file(config_path)
+        except Exception as exc:  # noqa: BLE001
+            # Report a bad/missing config as a clean protocol error instead of
+            # letting the exception abort the socket with an abnormal close.
+            await websocket.send(
+                json.dumps({"type": "error", "message": f"server config error: {exc}"})
+            )
+            return
         session: BOTAFServerSession | None = None
         async for raw in websocket:
             try:

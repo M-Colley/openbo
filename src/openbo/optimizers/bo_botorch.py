@@ -150,6 +150,11 @@ def run_bo_botorch(
     seed: int | None = 0,
 ) -> BORunResult:
     """Run simple BoTorch BO for a maximization objective."""
+    if n_init <= 0:
+        raise ValueError(
+            "n_init must be >= 1 for bo_botorch: at least one random observation is "
+            "needed before the first suggest()."
+        )
     optimizer = BoTorchSequentialOptimizer(
         BoTorchConfig(bounds=bounds, n_init=n_init, seed=seed)
     )
