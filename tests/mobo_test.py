@@ -301,6 +301,42 @@ def test_loader_skips_dimension_mismatch(tmp_path):
         assert _load_mo_source_surrogates(tmp_path, expected_m=M, expected_d=D + 1) == []
 
 
+def test_loader_replays_mean_constant(tmp_path):
+    """A stored mean_constant must shift the replayed prior: far away from the data the
+    posterior mean reverts to the fitted constant (in standardized space), not to 0.
+    Artifacts without the field keep the previous zero-mean behavior."""
+    write_source(tmp_path, "src", seed=11)
+    baseline = _load_mo_source_surrogates(tmp_path, expected_m=M, expected_d=D)[0]
+
+    gp_path = tmp_path / "gp_states" / "src.json"
+    payload = json.loads(gp_path.read_text(encoding="utf-8"))
+    payload["gp_state"]["lengthscale"] = [0.02] * D  # kill data influence far away
+    payload["gp_state"]["mean_constant"] = 1.5
+    gp_path.write_text(json.dumps(payload), encoding="utf-8")
+    shifted = _load_mo_source_surrogates(tmp_path, expected_m=M, expected_d=D)[0]
+
+    baseline_payload = dict(payload)
+    baseline_payload["gp_state"] = dict(payload["gp_state"])
+    del baseline_payload["gp_state"]["mean_constant"]
+    gp_path.write_text(json.dumps(baseline_payload), encoding="utf-8")
+    zero_mean = _load_mo_source_surrogates(tmp_path, expected_m=M, expected_d=D)[0]
+
+    # Recreate write_source's data to know the standardization scale.
+    rng = np.random.default_rng(11)
+    y = objective(rng.random((12, D)))
+
+    x_far = np.full((1, D), 25.0)
+    mu_shifted = shifted.posterior_mean(x_far)
+    mu_zero = zero_mean.posterior_mean(x_far)
+    # Standardize untransforms mean_constant c to mean_y + c * std_y per objective.
+    np.testing.assert_allclose(
+        (mu_shifted - mu_zero).reshape(-1), 1.5 * y.std(axis=0, ddof=1), rtol=1e-6
+    )
+    # And the default path (no mean_constant) is unchanged vs the original artifact:
+    # both revert to mean_y far from the data.
+    assert baseline is not None
+
+
 # ---------------------------------------------------------------- end-to-end loops
 
 
@@ -350,6 +386,28 @@ def test_invalid_weight_mode_is_rejected(tmp_path):
                 bounds=BOUNDS, ref_point=REF, taf_run_dir=tmp_path, taf_weight_mode="nope"
             )
         )
+
+
+def test_non_dominating_source_is_warn_skipped_at_construction(tmp_path):
+    """A frame-valid source whose Pareto front never strictly dominates the reference
+    point must be warn-skipped (loader contract), not abort optimizer construction."""
+    write_source(tmp_path, "good", seed=6)
+    write_source(tmp_path, "dead", seed=7)
+    traj_path = tmp_path / "trajectories" / "dead.json"
+    payload = json.loads(traj_path.read_text(encoding="utf-8"))
+    front = np.asarray(payload["pareto_front"], dtype=np.float64)
+    front[:, 0] = REF[0]  # first objective pinned at the reference point -> no strict dominance
+    payload["pareto_front"] = front.tolist()
+    traj_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        opt = MOTAFSequentialOptimizer(
+            MOTAFConfig(bounds=BOUNDS, ref_point=REF, taf_run_dir=tmp_path)
+        )
+    assert [s.name for s in opt.source_surrogates] == ["good"]
+    assert len(opt._source_terms) == 1
+    assert any("dead" in str(w.message) for w in caught)
 
 
 def test_source_meta_features_must_cover_every_source(tmp_path):

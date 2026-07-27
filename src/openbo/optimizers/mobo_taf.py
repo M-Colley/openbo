@@ -88,14 +88,17 @@ def _materialize_source_mean(
     Mirrors ``bo_taf``'s use of ``GPScratch(optimize_hyperparameters=False).fit(...)``: the
     stored hyperparameters are replayed and the model is conditioned on the trajectory, but
     never re-fitted. The kernel is constructed explicitly because BoTorch's default
-    ``SingleTaskGP`` covariance is a bare kernel with no outputscale to set.
+    ``SingleTaskGP`` covariance is a bare kernel with no outputscale to set. The fitted
+    constant mean is replayed too when the artifact carries ``mean_constant`` (in
+    standardized-target space); artifacts predating that field default to 0, matching
+    the previous behavior.
     """
     x_t = torch.tensor(np.asarray(x_values, dtype=np.float64), dtype=torch.double)
     y_t = torch.tensor(np.asarray(y_values, dtype=np.float64), dtype=torch.double)
     n, d = x_t.shape
     m = int(y_t.shape[1])
 
-    def _validated(entry: dict, label: str) -> tuple[str, NDArray[np.float64], float, float]:
+    def _validated(entry: dict, label: str) -> tuple[str, NDArray[np.float64], float, float, float]:
         kernel_type = str(entry.get("kernel_type", "matern52")).lower()
         if kernel_type not in _KERNELS:
             raise ValueError(
@@ -112,7 +115,10 @@ def _materialize_source_mean(
         noise = float(entry["noise"])
         if variance <= 0 or noise <= 0:
             raise ValueError(f"{label}: variance and noise must be positive.")
-        return kernel_type, lengthscale, variance, noise
+        mean_constant = float(entry.get("mean_constant", 0.0))
+        if not np.isfinite(mean_constant):
+            raise ValueError(f"{label}: mean_constant must be finite.")
+        return kernel_type, lengthscale, variance, noise, mean_constant
 
     # Hyperparameters are either one flat set shared by every objective (the original
     # single-objective-style schema) or a per-objective list under "objectives" -- real
@@ -132,7 +138,7 @@ def _materialize_source_mean(
 
     models = []
     for j in range(m):
-        kernel_type, lengthscale, variance, noise = hyper[j]
+        kernel_type, lengthscale, variance, noise, mean_constant = hyper[j]
         base = (
             MaternKernel(nu=2.5, ard_num_dims=d)
             if kernel_type == "matern52"
@@ -151,6 +157,7 @@ def _materialize_source_mean(
             )
             gp.covar_module.outputscale = torch.tensor(variance, dtype=torch.double)
             gp.likelihood.noise = torch.tensor(noise, dtype=torch.double)
+            gp.mean_module.constant = torch.tensor(mean_constant, dtype=torch.double)
         gp.eval()
         models.append(gp)
 
@@ -290,9 +297,26 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
             elif config.source_reference_mode != "front":
                 raise ValueError("source_reference_mode must be 'front' or 'quantile'.")
 
-        self._source_terms = [
-            build_source_hvi_term(s, self.ref_point) for s in self.source_surrogates
-        ]
+        # A source whose front cannot strictly dominate the reference point offers zero
+        # hypervolume improvement, and build_source_hvi_term raises for it. Honor the
+        # loader's warn-and-skip contract instead of aborting the whole run at
+        # construction, dropping the surrogate as well so weights stay aligned with
+        # terms; the existing zero-source degradation handles the all-dropped case.
+        kept_surrogates = []
+        source_terms = []
+        for s in self.source_surrogates:
+            try:
+                term = build_source_hvi_term(s, self.ref_point)
+            except ValueError as exc:
+                warnings.warn(
+                    f"MO TAF source '{s.name}': cannot build its hypervolume term "
+                    f"({exc}); skipping this source."
+                )
+                continue
+            kept_surrogates.append(s)
+            source_terms.append(term)
+        self.source_surrogates = kept_surrogates
+        self._source_terms = source_terms
 
     def _current_source_weights(self) -> NDArray[np.float64]:
         """Weights for this iteration, mirroring bo_taf's taf_m / taf_r selection."""
