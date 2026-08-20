@@ -2,8 +2,10 @@
 
 Multi-objective sibling of ``openbo.optimizers.bo_taf``, and deliberately the same state
 machine: source surrogates are reconstructed from a saved run directory, weighted per
-iteration by TAF-M (meta-feature similarity) or TAF-R (ranking agreement), and blended with
-the target's own acquisition through the weighted-average TAF form.
+iteration by TAF-M (meta-feature similarity) or TAF-R (objective-wise pairwise ranking
+agreement; the Pareto-dominance variant stays available as mode "taf_r_pareto" for
+ablation), and blended with the target's own acquisition through the weighted-average TAF
+form.
 
 The target term is inherited unchanged from ``MOBoTorchSequentialOptimizer`` -- this class
 only overrides how the acquisition is built. That inheritance is what makes the degenerate
@@ -39,6 +41,7 @@ from openbo.acquisition.taf_mo_ehvi import (
     build_source_hvi_term,
     compute_taf_m_weights,
     compute_taf_r_pareto_weights,
+    compute_taf_r_ranking_weights,
     mo_meta_features,
     taf_mo_ehvi_acquisition,
 )
@@ -58,6 +61,9 @@ class MOTAFConfig(MOBoTorchConfig):
     """Configuration for the ask/tell multi-objective TAF optimizer.
 
     Extends ``MOBoTorchConfig`` with the transfer settings; field names mirror ``TAFConfig``.
+    ``taf_weight_mode`` selects how source weights are computed each iteration: "taf_m"
+    (meta-feature similarity), "taf_r" (objective-wise pairwise ranking agreement), or
+    "taf_r_pareto" (Pareto-dominance agreement, kept for ablation).
     """
 
     taf_run_dir: str | Path = ""
@@ -259,8 +265,10 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
         super().__init__(config)
         self.config: MOTAFConfig = config
 
-        if config.taf_weight_mode not in {"taf_m", "taf_r"}:
-            raise ValueError("taf_weight_mode must be 'taf_m' or 'taf_r'.")
+        if config.taf_weight_mode not in {"taf_m", "taf_r", "taf_r_pareto"}:
+            raise ValueError(
+                "taf_weight_mode must be 'taf_m', 'taf_r', or 'taf_r_pareto'."
+            )
 
         # Number of suggest() calls made so far. Drives the source-only warmup window
         # independently of the observation count, which bootstrap() advances when
@@ -324,9 +332,14 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
         if n_sources == 0:
             return np.zeros(0, dtype=np.float64)
 
-        if self.config.taf_weight_mode == "taf_r":
+        if self.config.taf_weight_mode in {"taf_r", "taf_r_pareto"}:
+            weight_fn = (
+                compute_taf_r_ranking_weights
+                if self.config.taf_weight_mode == "taf_r"
+                else compute_taf_r_pareto_weights
+            )
             x_unit = (self.x_obs - self.lower) / self.scale
-            return compute_taf_r_pareto_weights(
+            return weight_fn(
                 source_surrogates=self.source_surrogates,
                 x_obs=x_unit,
                 y_obs=self.y_obs,

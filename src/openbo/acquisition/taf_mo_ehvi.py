@@ -8,8 +8,16 @@ same one, lifted from scalar improvement to hypervolume improvement:
     EI_target(x)                             qLogNEHVI_target(x)
     softplus(mu_i(x) - ref_i)                log HVI of mu_i(x) vs source i's Pareto front
     TAF-M: Epanechnikov over meta-features    same, with MO meta-features
-    TAF-R: mis-ordered observation PAIRS      mis-classified Pareto RELATIONS between pairs
+    TAF-R: mis-ordered observation PAIRS      mis-ordered PER-OBJECTIVE pairs (default), or
+                                             mis-classified Pareto RELATIONS (ablation)
     [w_t*T + sum w_i*S_i] / [w_t + sum w_i]  same, evaluated in log space
+
+    TAF-R ships in two variants. ``compute_taf_r_ranking_weights`` (the default, weight mode
+    "taf_r") scores each observation pair once PER OBJECTIVE, so a pair that is mutually
+    non-dominated -- the common case near a Pareto front -- still contributes M rankings of
+    evidence. ``compute_taf_r_pareto_weights`` (weight mode "taf_r_pareto", kept for
+    ablation) scores each pair once via its Pareto dominance relation, which discards
+    exactly those pairs and can leave the similarity estimate starved of evidence.
 
 Two properties of the scalar version are preserved exactly because they are what make the
 mechanism work:
@@ -53,6 +61,7 @@ __all__ = [
     "compute_taf_m_weights",
     "epanechnikov_weight",
     "pareto_relation",
+    "compute_taf_r_ranking_weights",
     "compute_taf_r_pareto_weights",
     "build_source_hvi_term",
     "taf_mo_ehvi_acquisition",
@@ -129,6 +138,106 @@ def pareto_relation(a: NDArray[np.float64], b: NDArray[np.float64], eps: float =
     return 0
 
 
+def compute_taf_r_ranking_weights(
+    source_surrogates: list[MOSourceTaskSurrogate],
+    x_obs: NDArray[np.float64],
+    y_obs: NDArray[np.float64],
+    rho: float,
+    min_informative_pairs: int = 1,
+) -> NDArray[np.float64]:
+    """TAF-R weights from objective-wise pairwise ranking agreement (default "taf_r" mode).
+
+    Each observation pair (i, j) is scored once per objective m through the ranking label
+
+        r_ijm = +1 if f_m(x_i) > f_m(x_j),  -1 if f_m(x_i) < f_m(x_j),  0 if tied,
+
+    evaluated on the target's observed values and on the source's posterior mean, and the
+    disagreement distance for source s is the label mismatch rate over ALL comparisons:
+
+        d_s = (1 / (M * C(n, 2))) * sum_{i<j} sum_m 1[ r_ijm^target != r_ijm^source ]
+
+    The denominator is fixed at M * C(n, 2): a tie is a ranking claim of its own, so a
+    strict order asserted against a tie counts as a (full) mismatch rather than being
+    skipped. Ties are detected with a small absolute tolerance because exact float
+    equality is brittle for GP posterior means.
+
+    This replaces Pareto-dominance agreement (``compute_taf_r_pareto_weights``) as the
+    default because dominance relations under-inform the similarity estimate: pairs near
+    the Pareto front are typically mutually non-dominated, which the dominance view must
+    treat as "incomparable" even though each such pair still carries M usable per-objective
+    rankings (e.g. [0.1, 0.2] vs [0.4, 0.1]: no dominance, yet objective 1 clearly ranks
+    x2 > x1 and objective 2 ranks x1 > x2). In the extreme -- every observation on a
+    trade-off curve -- dominance agreement collects zero evidence and returns the null
+    result, while this estimator still scores M rankings per pair. It is also cheaper:
+    sign comparisons only, no dominance determination.
+
+    One guard sits on top of the formula, mirroring the scalar module's zero-comparable-
+    pairs rule and the Pareto variant's source_strict rule: a source that asserts a strict
+    order on fewer than ``min_informative_pairs`` comparisons (e.g. a flat surrogate, all
+    labels 0) is weighted 0.0 outright. The formula alone would hand such a source
+    d_s = 1 against an informative target -- which still earns weight once rho > 1 -- and
+    d_s = 0 (FULL weight) against a degenerate all-tied target, despite it carrying no
+    ranking information in either case.
+
+    Remaining degenerate cases follow the single-objective module: no sources -> empty,
+    fewer than two observations -> normalized uniform (no ranking evidence yet), and all
+    weights underflowing -> zeros so the acquisition falls back to the target term alone.
+    """
+    x_obs = np.asarray(x_obs, dtype=np.float64)
+    y_obs = np.asarray(y_obs, dtype=np.float64)
+    if x_obs.ndim != 2:
+        raise ValueError("x_obs must have shape (n, d).")
+    if y_obs.ndim != 2 or y_obs.shape[0] != x_obs.shape[0]:
+        raise ValueError("y_obs must have shape (n, M) and match x_obs rows.")
+
+    n_sources = len(source_surrogates)
+    n = y_obs.shape[0]
+    eps = 1e-12
+    if n_sources == 0:
+        return np.zeros(0, dtype=np.float64)
+    # With <2 observations there is no ranking evidence yet; fall back to a
+    # uniform distribution (normalized, matching compute_taf_m_weights' contract).
+    if n < 2:
+        return np.ones(n_sources, dtype=np.float64) / n_sources
+
+    i_idx, j_idx = np.triu_indices(n, k=1)
+
+    def ranking_labels(values: NDArray[np.float64]) -> NDArray[np.int8]:
+        diff = values[i_idx] - values[j_idx]  # (n_pairs, M)
+        return np.where(np.abs(diff) <= eps, 0, np.sign(diff)).astype(np.int8)
+
+    target_rank = ranking_labels(y_obs)
+    n_comparisons = target_rank.size  # M * C(n, 2)
+
+    weights: list[float] = []
+    for source in source_surrogates:
+        mu_source = np.asarray(source.posterior_mean(x_obs), dtype=np.float64)
+        if mu_source.shape != y_obs.shape:
+            # A (n,) or (n, 1) mean would broadcast through the comparisons below and
+            # silently corrupt the distance; fail loudly instead.
+            raise ValueError(
+                f"source '{source.name}' posterior mean has shape {mu_source.shape}, "
+                f"expected {y_obs.shape}."
+            )
+        source_rank = ranking_labels(mu_source)
+        source_strict = int(np.count_nonzero(source_rank))
+        if source_strict < max(1, int(min_informative_pairs)):
+            weights.append(0.0)
+            continue
+        disagreements = int(np.count_nonzero(target_rank != source_rank))
+        distance = float(disagreements / n_comparisons)
+        weights.append(epanechnikov_weight(distance, rho))
+
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    total_weight = float(weights_arr.sum())
+    # All sources rejected (their rankings contradict the observations beyond the
+    # bandwidth): return zeros so the acquisition falls back to target-only, rather than
+    # re-injecting provably contradicting sources at uniform weight.
+    if total_weight <= eps:
+        return np.zeros(n_sources, dtype=np.float64)
+    return weights_arr / total_weight
+
+
 def compute_taf_r_pareto_weights(
     source_surrogates: list[MOSourceTaskSurrogate],
     x_obs: NDArray[np.float64],
@@ -136,9 +245,11 @@ def compute_taf_r_pareto_weights(
     rho: float,
     min_informative_pairs: int = 1,
 ) -> NDArray[np.float64]:
-    """TAF-R weights from Pareto-dominance agreement on current target observations.
+    """TAF-R weights from Pareto-dominance agreement (ablation "taf_r_pareto" mode).
 
-    Multi-objective counterpart of ``compute_taf_r_weights``. For each observation pair the
+    Kept for comparison studies; ``compute_taf_r_ranking_weights`` is the default because
+    dominance relations discard the per-objective order of mutually non-dominated pairs
+    (see that function's docstring). For each observation pair the
     target and the source each assert one of {a dominates b, b dominates a, incomparable};
     per-pair disagreement is 0.0 for an identical relation, 0.5 when one asserts a strict
     dominance and the other calls it incomparable, and 1.0 for opposite strict dominances.
