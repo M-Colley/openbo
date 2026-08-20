@@ -10,16 +10,16 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-    "botorch>=0.17.2",
+    "botorch>=0.18.1",
     "gpytorch>=1.15.2",
-    "matplotlib>=3.10.9",
-    "numpy>=2.4.4",
-    "pandas>=3.0.2",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
     "pyyaml>=6.0.3",
     "scipy>=1.17.1",
-    "torch>=2.11.0",
-    "tqdm>=4.67.3",
-    "websockets>=16.0",
+    "torch>=2.12.0",
+    "tqdm>=4.70.0",
+    "websockets>=17.0",
 ]
 
 [build-system]
@@ -31,8 +31,8 @@ module-name = "openbo"
 
 [dependency-groups]
 dev = [
-    "ipykernel>=7.2.0",
-    "mypy>=1.20.2",
-    "pytest>=9.0.3",
-    "ruff>=0.15.12",
+    "ipykernel>=7.3.0",
+    "mypy>=2.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.3",
 ]
