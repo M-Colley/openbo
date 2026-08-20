@@ -630,7 +630,7 @@ result = run_mobo_taf(
     bounds=[(0.0, 1.0)] * 3,
     ref_point=[-1.0, -1.0],
     taf_run_dir="meta-bo-training/mo-taf-gps/my_sources",
-    taf_weight_mode="taf_r",  # "taf_m" (default), "taf_r", or "taf_r_pareto"
+    taf_weight_mode="taf_r",  # the default; also "taf_m" or "taf_r_pareto"
     n_init=5, n_iter=25, seed=0,
 )
 ```
@@ -644,9 +644,12 @@ CHI '24 Eq. 6, quantile source references) live on `MOTAFConfig`; construct
 - **`taf_m` — meta-feature similarity.** Distance between task descriptors
   `[d, mean_1, std_1, ..., mean_M, std_M]`, passed through an Epanechnikov kernel with
   bandwidth `rho`. Works before any target data exists.
-- **`taf_r` — objective-wise pairwise ranking agreement (the default TAF-R).** For every
-  pair of observed target points and every objective, compare who ranks higher according
-  to the target's observations versus the source's predictions:
+- **`taf_r` — objective-wise pairwise ranking agreement (the default).** Preferred
+  because it scores sources on actual predictive evidence — it can order a source pool by
+  task similarity and zero out a source that contradicts the observations, which
+  meta-feature distance cannot — at negligible cost next to the acquisition
+  optimization. For every pair of observed target points and every objective, compare who
+  ranks higher according to the target's observations versus the source's predictions:
 
       d_s = (# comparisons where source and target disagree) / (M * C(n, 2))
 

@@ -61,15 +61,17 @@ class MOTAFConfig(MOBoTorchConfig):
     """Configuration for the ask/tell multi-objective TAF optimizer.
 
     Extends ``MOBoTorchConfig`` with the transfer settings; field names mirror ``TAFConfig``.
-    ``taf_weight_mode`` selects how source weights are computed each iteration: "taf_m"
-    (meta-feature similarity), "taf_r" (objective-wise pairwise ranking agreement), or
-    "taf_r_pareto" (Pareto-dominance agreement, kept for ablation).
+    ``taf_weight_mode`` selects how source weights are computed each iteration: "taf_r"
+    (objective-wise pairwise ranking agreement; the default, because it scores sources on
+    actual predictive evidence and can zero out a contradicting source, at negligible
+    cost), "taf_m" (meta-feature similarity), or "taf_r_pareto" (Pareto-dominance
+    agreement, kept for ablation).
     """
 
     taf_run_dir: str | Path = ""
     n_iter: int = 25
     rho: float = 1.0
-    taf_weight_mode: str = "taf_m"
+    taf_weight_mode: str = "taf_r"
     target_weight: float = 1.0
     source_meta_features: dict[str, NDArray[np.float64]] | None = None
     target_meta_features: NDArray[np.float64] | None = None
@@ -511,7 +513,7 @@ def run_mobo_taf(
     n_init: int = 5,
     n_iter: int = 25,
     rho: float = 1.0,
-    taf_weight_mode: str = "taf_m",
+    taf_weight_mode: str = "taf_r",
     target_weight: float = 1.0,
     source_only_warmup_iters: int = 0,
     seed: int | None = 0,
