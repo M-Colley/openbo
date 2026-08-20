@@ -1,6 +1,82 @@
 # OpenBO
 
-OpenBO is a research + teaching Python library for Bayesian optimization (BO) and meta-BO.
+OpenBO is a research + teaching Python library for **Bayesian optimization (BO)** — a
+strategy for optimizing functions that are expensive to evaluate — and **meta-BO**, which
+reuses data from previously solved, related tasks to optimize a new task faster. It
+includes single- and multi-objective optimizers, transfer acquisition functions (TAF),
+benchmark tooling, and WebSocket servers for driving the optimizers from external
+applications.
+
+New to the topic? Read [Background: the key ideas in plain language](#background-the-key-ideas-in-plain-language)
+first — the rest of the README assumes those concepts — then jump to
+[Installation and quickstart](#1-installation-and-quickstart).
+
+## Background: the key ideas in plain language
+
+Skip this section if you already work with Bayesian optimization.
+
+**The problem.** You want the best design `x` (a vector of parameters) for some objective
+`f(x)`, but evaluating `f` is expensive — a user-study session, a simulation, a real
+experiment. You can only afford a few dozen evaluations, so grid search and gradient
+descent are off the table. Two conventions hold everywhere in OpenBO: inputs are
+normalized to the unit cube `[0, 1]^d`, and every objective is **maximized**.
+
+**Bayesian optimization (BO).** BO spends evaluations strategically by looping:
+
+1. Fit a cheap probabilistic model (a *surrogate*) to all observations so far.
+2. Use the surrogate to pick the most promising next `x` (by maximizing an
+   *acquisition function*).
+3. Evaluate the real objective there, add the result to the data, repeat.
+
+**Gaussian process (GP).** The standard surrogate. For any `x` it predicts a mean (its
+best guess of `f(x)`) *and* an uncertainty around that guess. `models/gp_scratch.py` is a
+NumPy implementation built for readability; the BoTorch-backed optimizers use the
+`botorch`/`gpytorch` stack.
+
+**Acquisition function.** A cheap score of "how useful would evaluating here be next",
+trading off *exploitation* (high predicted mean) against *exploration* (high uncertainty).
+The single-objective optimizers use **Expected Improvement (EI)**: the expected amount by
+which `f(x)` will beat the best value seen so far.
+
+**Meta-BO / transfer BO.** Plain BO starts from zero on every task. When you have already
+optimized *related* tasks (previous users, previous device generations, other functions
+from the same family), their data should give the new task a head start. OpenBO's
+transfer method is the **Transfer Acquisition Function (TAF)**: each past task is stored
+as a **source** GP, the new task is the **target**, and the acquisition becomes a
+weighted average of the target's EI and each source's predicted improvement. Source
+weights are recomputed every iteration, so unhelpful sources fade out as target evidence
+accumulates. Two weighting schemes exist:
+
+- **TAF-M** weights a source by how similar its cheap task descriptors
+  (*meta-features*) are to the target's.
+- **TAF-R** weights a source by how well its predicted *ranking* of the observed target
+  points agrees with their actually observed ranking.
+
+**Multi-objective BO (MOBO).** Real designs juggle competing objectives (fast *and*
+accurate, comfortable *and* precise). With `M` objectives there is usually no single best
+point; the solutions worth keeping form the **Pareto front** — points where no objective
+can improve without another getting worse. (Point `a` *dominates* `b` when `a` is at
+least as good in every objective and strictly better in at least one; the front is the
+set of non-dominated points.) Progress is measured by **hypervolume**: how much objective
+space the current front covers beyond a fixed, pessimistic **reference point**. The
+acquisition becomes **Expected Hypervolume Improvement (EHVI)** — how much a candidate is
+expected to grow that hypervolume — and the transfer variant (**TAF-EHVI**) applies the
+same TAF weighted average to hypervolume improvements. See
+[section 5](#5-multi-objective-bo-and-transfer-mo-taf--taf-ehvi).
+
+**Glossary of repo-specific terms**
+
+| Term | Meaning |
+|------|---------|
+| task | One objective function to optimize (one Branin variant, one user, one device). |
+| family / variant | A base test function plus random affine transformations of it — many related tasks. |
+| split | A persisted train/test partition of a family (`configs/family_splits/`). |
+| source / target | An already-optimized task whose GP is reused / the new task being optimized. |
+| trajectory | JSON record of one run: evaluated `x_values`, `y_values`, best-so-far values. |
+| `gp_state` | Saved GP hyperparameters from a finished source run (`gp_states/*.json`); TAF replays them without re-fitting. |
+| regret | `optimal_value - best_value_so_far`; plotted as `log10(regret)`, lower is better. |
+| ask/tell | Interface where the optimizer *suggests* a point (ask) and you *observe* the result back (tell). The WebSocket servers speak this protocol. |
+| `rho` | TAF kernel bandwidth: how dissimilar a source may be before its weight reaches 0. |
 
 ## 0. Current scope
 
@@ -18,6 +94,7 @@ OpenBO targets **research and teaching** in **normalized** input space `[0, 1]^d
 - **BO from scratch**: NumPy GP + expected improvement; multistart L-BFGS-B search (and a grid-style variant) in `bo_scratch`.
 - **BoTorch BO**: `SingleTaskGP` + `LogExpectedImprovement` in `bo_botorch`.
 - **TAF** (`bo_taf`, `bo_taf_m`, `bo_taf_r`): transfer acquisition using source surrogates loaded from a directory of saved `gp_states/` + `trajectories/` (`bo_taf`).
+- **Multi-objective BO** (`mobo_botorch`: qLogNEHVI) and **MO-TAF / TAF-EHVI** (`mobo_taf`), currently as a Python API — see [section 5](#5-multi-objective-bo-and-transfer-mo-taf--taf-ehvi).
 
 **Benchmarks, trajectories, and plots**
 
@@ -68,16 +145,18 @@ uv run pytest
 
 ### Table of contents
 
+- [Background: the key ideas in plain language](#background-the-key-ideas-in-plain-language)
 - [0. Current scope](#0-current-scope)
 - [1. Installation and quickstart](#1-installation-and-quickstart)
 - [2. Single-function workflow](#2-single-function-workflow)
 - [3. Family-of-functions workflow](#3-family-of-functions-workflow)
 - [4. Meta-BO training and testing](#4-meta-bo-training-and-testing)
-- [5. Server-based Optimization Workflow](#5-server-based-optimization-workflow)
-- [6. End-to-end TAF workflow: family split → scratch GPs → TAF](#6-end-to-end-taf-workflow-family-split-scratch-gps-taf)
-- [7. Results folder convention](#7-results-folder-convention)
-- [8. Important benchmark results](#8-important-benchmark-results)
-- [9. Project structure](#9-project-structure)
+- [5. Multi-objective BO and transfer (MO-TAF / TAF-EHVI)](#5-multi-objective-bo-and-transfer-mo-taf--taf-ehvi)
+- [6. Server-based Optimization Workflow](#6-server-based-optimization-workflow)
+- [7. End-to-end TAF workflow: family split → scratch GPs → TAF](#7-end-to-end-taf-workflow-family-split--scratch-gps--taf)
+- [8. Results folder convention](#8-results-folder-convention)
+- [9. Important benchmark results](#9-important-benchmark-results)
+- [10. Project structure](#10-project-structure)
 - [Contact](#contact)
 
 ## 2. Single-function workflow
@@ -494,9 +573,102 @@ Notes:
 - `bo_taf_m` / `bo_taf_r` are recommended for cleaner benchmark tracking.
 
 
-## 5. Server-based Optimization Workflow
+## 5. Multi-objective BO and transfer (MO-TAF / TAF-EHVI)
 
-Here, we provide the server-based interface for any systems to communicate with our optimizers via WebSOckets. With the steps below, you can run the same BO backends **over WebSockets** when your objective lives outside this process (simulator, service, or other language): start a server, speak the JSON ask/tell protocol, and use the included fake client for a quick smoke test. 
+Multi-objective counterparts of the single-objective optimizers: the objective returns a
+**vector** of `M` values (all maximized), "best so far" becomes the **hypervolume** of the
+Pareto front relative to a fixed reference point, and EI becomes a log-space Expected
+Hypervolume Improvement (qLogNEHVI). These optimizers are currently a Python API (no
+CLI/server wiring yet):
+
+- `openbo.optimizers.mobo_botorch` — plain MOBO: one `SingleTaskGP` over all `M`
+  objectives + qLogNEHVI acquisition.
+- `openbo.optimizers.mobo_taf` — MO-TAF (TAF-EHVI): blends the target's qLogNEHVI with
+  each source's predicted hypervolume improvement using the same weighted-average TAF
+  form (and the same warn-and-skip artifact loading) as `bo_taf`.
+- `openbo.acquisition.taf_mo_ehvi` — the acquisition-side building blocks (source terms,
+  weight computations, log-space blend).
+
+### Quickstart (plain MOBO)
+
+```python
+import numpy as np
+from openbo.optimizers.mobo_botorch import run_mobo_botorch
+
+def objective(x):  # (n, d) -> (n, M), every objective maximized
+    x = np.atleast_2d(x)
+    f1 = 1.0 - np.sum((x - 0.3) ** 2, axis=1)
+    f2 = 1.0 - np.sum((x - 0.7) ** 2, axis=1)
+    return np.stack([f1, f2], axis=1)
+
+result = run_mobo_botorch(
+    objective,
+    bounds=[(0.0, 1.0)] * 3,
+    ref_point=[-1.0, -1.0],  # must be dominated by any point that should count
+    n_init=5, n_iter=25, seed=0,
+)
+print(result.pareto_front)             # non-dominated observations, shape (P, M)
+print(result.hypervolume_history[-1])  # one entry per evaluation
+```
+
+The **reference point** is your floor of "still acceptable" objective values: only points
+strictly better than it in *every* objective contribute hypervolume, so pick something
+clearly worse than any solution you care about.
+
+### Transfer: MO-TAF
+
+Source artifacts use the same directory layout as `bo_taf` (`gp_states/<task>.json` +
+`trajectories/<task>.json`), with `y_values` extended to shape `(n, M)`, optionally a
+stored `pareto_front`, and `gp_state` either as one flat hyperparameter set or with
+per-objective entries under `"objectives": [...]`.
+
+```python
+from openbo.optimizers.mobo_taf import run_mobo_taf
+
+result = run_mobo_taf(
+    objective,
+    bounds=[(0.0, 1.0)] * 3,
+    ref_point=[-1.0, -1.0],
+    taf_run_dir="meta-bo-training/mo-taf-gps/my_sources",
+    taf_weight_mode="taf_r",  # "taf_m" (default), "taf_r", or "taf_r_pareto"
+    n_init=5, n_iter=25, seed=0,
+)
+```
+
+Advanced knobs (source-only warmup, population-weight decay following Liao et al.
+CHI '24 Eq. 6, quantile source references) live on `MOTAFConfig`; construct
+`MOTAFSequentialOptimizer` directly for ask/tell use.
+
+### How MO-TAF weights sources
+
+- **`taf_m` — meta-feature similarity.** Distance between task descriptors
+  `[d, mean_1, std_1, ..., mean_M, std_M]`, passed through an Epanechnikov kernel with
+  bandwidth `rho`. Works before any target data exists.
+- **`taf_r` — objective-wise pairwise ranking agreement (the default TAF-R).** For every
+  pair of observed target points and every objective, compare who ranks higher according
+  to the target's observations versus the source's predictions:
+
+      d_s = (# comparisons where source and target disagree) / (M * C(n, 2))
+
+  with ranking labels `+1 / -1 / 0 (tie)` per comparison. Worked example with two
+  designs: the target observed `f(x1) = [0.5, 0.7]` and `f(x2) = [0.6, 0.8]`; a source
+  predicts `[0.1, 0.4]` and `[0.4, 0.1]`. Objective 1 agrees (both rank `x2 > x1`),
+  objective 2 disagrees — so `d_s = 1/2`. Low disagreement means high weight (same
+  Epanechnikov kernel as `taf_m`).
+- **`taf_r_pareto` — Pareto-dominance agreement (ablation variant).** Scores each pair
+  once by whether source and target assert the same dominance relation (`x1` dominates /
+  `x2` dominates / incomparable). Kept for comparison studies: points near the Pareto
+  front are usually *mutually non-dominated*, so this variant can run out of informative
+  pairs exactly where optimization spends most of its time — that evidence starvation is
+  why the objective-wise `taf_r` is the default.
+
+`tests/mobo_test.py` doubles as executable documentation for all of the above, including
+a brute-force check that the deterministic source EHVI term equals true hypervolume
+improvement.
+
+## 6. Server-based Optimization Workflow
+
+Here, we provide the server-based interface for any systems to communicate with our optimizers via WebSockets. With the steps below, you can run the same BO backends **over WebSockets** when your objective lives outside this process (simulator, service, or other language): start a server, speak the JSON ask/tell protocol, and use the included fake client for a quick smoke test. 
 
 OpenBO supports a server-style optimization loop for external applications
 that evaluate candidate designs outside this Python process.
@@ -712,7 +884,7 @@ This writes `test_results/trajectories/fake_client_taf_done_x_locations.png` nex
 (same 2D heatmap + iteration-colored points as `scripts/run_benchmark.py --plot-x-locations`).
 Use `--plot-output path/to/plot.png` to choose the PNG path; Branin is assumed (`input_dim: 2`).
 
-## 6. End-to-end TAF workflow: family split → scratch GPs → TAF
+## 7. End-to-end TAF workflow: family split → scratch GPs → TAF
 
 Tutorial and example of using TAF for your own applications. Walk through the **manual** end-to-end pipeline for transfer BO: create a split, train source tasks through the scratch server (saving `gp_states/` and `trajectories/`), point the TAF server at that run directory, optimize test tasks, and optionally plot regret—substituting your own client where the examples use Branin or family helpers. 
 
@@ -950,7 +1122,7 @@ Architecture note:
 - `openbo.optimizers.bo_taf` is served by `server_optimizers/bo_taf_server.py` to keep TAF-specific config isolated. Random init is sampled once (same RNG draw pattern as `bootstrap()`), committed as one batched `observe`, and `n_iter` matches `run_bo_taf` (including the extra internal budget step when `n_init > 0`).
 
 
-## 7. Results folder convention
+## 8. Results folder convention
 
 By default, artifacts are organized under `test_results/`:
 
@@ -968,7 +1140,7 @@ Practical workflow convention:
 - Use `--results-dir benchmark_results` for large, milestone-style benchmark runs that you want to keep stable over time.
 - Prefer unique `--test-id` values for archived runs in `benchmark_results/` to avoid accidental overwrite.
 
-## 8. Important benchmark results
+## 9. Important benchmark results
 
 **Purpose:** Point to **saved benchmark campaigns** (scratch vs BoTorch, with and without output noise) and visual search-behavior comparisons you can browse without rerunning optimizers.
 
@@ -981,7 +1153,7 @@ We thoroughly compared the performance of our BO, implemented from scratch (`bo_
 
 
 
-## 9. Project structure
+## 10. Project structure
 
 - `README.md` - project overview, workflows, and command examples.
 - `pyproject.toml` - dependencies, build config, and project metadata.
@@ -993,8 +1165,8 @@ We thoroughly compared the performance of our BO, implemented from scratch (`bo_
 - `src/openbo/` - main package (`import openbo`; distribution name is `open-bo`).
   - `test_functions/` - synthetic objectives, transforms, family/task variants, and registry utilities.
   - `models/` - GP implementations and kernels (`gp_scratch.py`, `kernels.py`, plus placeholders).
-  - `acquisition/` - EI + TAF acquisition logic and placeholder acquisition modules.
-  - `optimizers/` - implemented optimizers (`random_search`, `bo_scratch`, `bo_botorch`, `bo_taf`) plus placeholders.
+  - `acquisition/` - EI + TAF acquisition logic, the multi-objective TAF-EHVI building blocks (`taf_mo_ehvi.py`), and placeholder acquisition modules.
+  - `optimizers/` - implemented optimizers (`random_search`, `bo_scratch`, `bo_botorch`, `bo_taf`, and the multi-objective `mobo_botorch` + `mobo_taf`) plus placeholders.
   - `server_optimizers/` - WebSocket-facing session adapters for generic BO (`bo_server.py`) and TAF (`bo_taf_server.py`).
   - `benchmarks/` - benchmark runner + reproducibility helpers (and placeholder metrics/plotting modules).
 - `scripts/` - local benchmark/training/plot entrypoints.
@@ -1004,7 +1176,7 @@ We thoroughly compared the performance of our BO, implemented from scratch (`bo_
   - `run_family_benchmark.py` - run one method across a task family and save per-task trajectories.
   - `plot_family_results.py` - family mean/std and best-so-far log-regret plots.
   - `plot_family_from_benchmark_runs.py` - merge any number of saved `run_family_benchmark.py` run folders into one comparison plot (custom legend labels per `--run`).
-    - `train_taf.py` - produce TAF source artifacts (`trajectories/`, `gp_states/`) from training tasks.
+  - `train_taf.py` - produce TAF source artifacts (`trajectories/`, `gp_states/`) from training tasks.
   - `plot_taf_gp_predictions.py` - 2D GP mean/std heatmaps from saved TAF run artifacts.
   - `plot_taf_acquisition_heatmap.py` - visualize stored TAF acquisition query values by iteration.
   - `run_botorch_fake_client.py` - toy client loop for BoTorch-oriented external-objective testing.
