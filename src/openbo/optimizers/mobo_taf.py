@@ -516,9 +516,20 @@ def run_mobo_taf(
     taf_weight_mode: str = "taf_r",
     target_weight: float = 1.0,
     source_only_warmup_iters: int = 0,
+    decay_start_iter: int = 2,
+    decay_rate: float = 0.3,
     seed: int | None = 0,
 ) -> MORunResult:
-    """Run multi-objective BO with the TAF-EHVI acquisition and saved source surrogates."""
+    """Run multi-objective BO with the TAF-EHVI acquisition and saved source surrogates.
+
+    Unlike ``MOTAFConfig`` (whose neutral default is "never decay", plain TAF), this
+    entry point defaults the population-weight decay ON (d1=2, d2=0.3, the values the
+    BOforUnity study configuration ships): without decay the sources keep an O(1)
+    acquisition contribution while the converging target's improvement shrinks toward
+    zero, so late suggestions stay source-driven and final-checkpoint hypervolume falls
+    below plain MOBO — the effect gamma(t) (Liao et al., CHI'24, Eq. 6) exists to fix.
+    Pass ``decay_rate=0.0`` explicitly for a no-decay ablation.
+    """
     optimizer = MOTAFSequentialOptimizer(
         MOTAFConfig(
             bounds=bounds,
@@ -530,6 +541,8 @@ def run_mobo_taf(
             taf_weight_mode=taf_weight_mode,
             target_weight=target_weight,
             source_only_warmup_iters=source_only_warmup_iters,
+            decay_start_iter=decay_start_iter,
+            decay_rate=decay_rate,
             seed=seed,
         )
     )

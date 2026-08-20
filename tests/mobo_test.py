@@ -486,6 +486,10 @@ def test_run_mobo_taf_runs_and_records_transfer_state(tmp_path):
     assert res.final_state["n_sources"] == 2
     assert res.final_state["taf_weight_mode"] == "taf_r"
     assert len(res.final_state["last_source_weights"]) == 2
+    # The study entry point must default the population-weight decay ON (d1=2, d2=0.3);
+    # decay-off runs let sources keep steering forever and finish below plain MOBO.
+    assert res.final_state["decay_start_iter"] == 2
+    assert res.final_state["decay_rate"] == pytest.approx(0.3)
 
 
 def test_taf_with_no_sources_is_identical_to_plain_mobo(tmp_path):
