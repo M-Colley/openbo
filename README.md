@@ -651,13 +651,15 @@ CHI '24 Eq. 6, quantile source references) live on `MOTAFConfig`; construct
   optimization. For every pair of observed target points and every objective, compare who
   ranks higher according to the target's observations versus the source's predictions:
 
-      d_s = (# comparisons where source and target disagree) / (M * C(n, 2))
+      d_s = (# target-strict comparisons where source and target disagree)
+            / (# target-strict comparisons)
 
-  with ranking labels `+1 / -1 / 0 (tie)` per comparison. Worked example with two
-  designs: the target observed `f(x1) = [0.5, 0.7]` and `f(x2) = [0.6, 0.8]`; a source
-  predicts `[0.1, 0.4]` and `[0.4, 0.1]`. Objective 1 agrees (both rank `x2 > x1`),
-  objective 2 disagrees — so `d_s = 1/2`. Low disagreement means high weight (same
-  Epanechnikov kernel as `taf_m`).
+  with ranking labels `+1 / -1 / 0 (tie)` per comparison. Target-tied comparisons are
+  skipped; a source tie against a target strict order is a disagreement. Worked example
+  with two designs: the target observed `f(x1) = [0.5, 0.7]` and `f(x2) = [0.6, 0.8]`;
+  a source predicts `[0.1, 0.4]` and `[0.4, 0.1]`. Objective 1 agrees (both rank
+  `x2 > x1`), objective 2 disagrees — so `d_s = 1/2`. Low disagreement means high
+  weight (same Epanechnikov kernel as `taf_m`).
 - **`taf_r_pareto` — Pareto-dominance agreement (ablation variant).** Scores each pair
   once by whether source and target assert the same dominance relation (`x1` dominates /
   `x2` dominates / incomparable). Kept for comparison studies: points near the Pareto

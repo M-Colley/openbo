@@ -243,10 +243,9 @@ def test_taf_r_ranking_uses_non_dominated_pairs_the_pareto_variant_discards():
     assert np.all(w_pareto == 0.0)
 
 
-def test_taf_r_ranking_counts_tie_vs_strict_as_mismatch_over_fixed_denominator():
-    """Per the trichotomy r in {+1, -1, 0}: a tie is a ranking claim, so strict-vs-tie is
-    a mismatch, and the denominator stays M * C(n, 2). One pair, obj 1 tied on the target
-    but ordered by the source (mismatch), obj 2 ordered identically (match) -> d = 1/2."""
+def test_taf_r_ranking_skips_target_ties_from_distance_and_denominator():
+    """A source order at a target tie is ignored. Only objective 2 is target-strict here,
+    where both sources agree, so their equal raw weights normalize to one half each."""
     y = np.array([[1.0, 0.0], [1.0, 1.0]])
     x = TARGET_X[:2]
     sources = [
@@ -254,8 +253,15 @@ def test_taf_r_ranking_counts_tie_vs_strict_as_mismatch_over_fixed_denominator()
         _FixedMeanSource("copy", y),
     ]
     w = compute_taf_r_ranking_weights(sources, x, y, rho=1.0)
-    expected_ratio = epanechnikov_weight(0.5, 1.0) / epanechnikov_weight(0.0, 1.0)
-    assert w[0] / w[1] == pytest.approx(expected_ratio)
+    assert w == pytest.approx([0.5, 0.5])
+
+
+def test_taf_r_ranking_rejects_all_target_ties():
+    """An all-tied target supplies no pairwise ranking evidence to transfer."""
+    y = np.ones((2, M))
+    source = _FixedMeanSource("strict", np.array([[0.0, 0.0], [1.0, 1.0]]))
+    w = compute_taf_r_ranking_weights([source], TARGET_X[:2], y, rho=1.0)
+    assert w == pytest.approx([0.0])
 
 
 def test_taf_r_ranking_rejects_wrong_mean_shape():
