@@ -151,15 +151,15 @@ def compute_taf_r_ranking_weights(
 
         r_ijm = +1 if f_m(x_i) > f_m(x_j),  -1 if f_m(x_i) < f_m(x_j),  0 if tied,
 
-    evaluated on the target's observed values and on the source's posterior mean, and the
-    disagreement distance for source s is the label mismatch rate over ALL comparisons:
+    evaluated on the target's observed values and on the source's posterior mean. Target-tied
+    comparisons carry no strict ranking evidence and are skipped. The disagreement distance
+    for source s is therefore the label mismatch rate over target-strict comparisons:
 
-        d_s = (1 / (M * C(n, 2))) * sum_{i<j} sum_m 1[ r_ijm^target != r_ijm^source ]
+        d_s = sum_{i<j,m} 1[r_ijm^target != 0] 1[r_ijm^target != r_ijm^source]
+              / sum_{i<j,m} 1[r_ijm^target != 0]
 
-    The denominator is fixed at M * C(n, 2): a tie is a ranking claim of its own, so a
-    strict order asserted against a tie counts as a (full) mismatch rather than being
-    skipped. Ties are detected with a small absolute tolerance because exact float
-    equality is brittle for GP posterior means.
+    A source tie against a target strict order remains a mismatch. Ties are detected with a
+    small absolute tolerance because exact float equality is brittle for GP posterior means.
 
     This replaces Pareto-dominance agreement (``compute_taf_r_pareto_weights``) as the
     default because dominance relations under-inform the similarity estimate: pairs near
@@ -173,11 +173,10 @@ def compute_taf_r_ranking_weights(
 
     One guard sits on top of the formula, mirroring the scalar module's zero-comparable-
     pairs rule and the Pareto variant's source_strict rule: a source that asserts a strict
-    order on fewer than ``min_informative_pairs`` comparisons (e.g. a flat surrogate, all
-    labels 0) is weighted 0.0 outright. The formula alone would hand such a source
-    d_s = 1 against an informative target -- which still earns weight once rho > 1 -- and
-    d_s = 0 (FULL weight) against a degenerate all-tied target, despite it carrying no
-    ranking information in either case.
+    order on fewer than ``min_informative_pairs`` target-strict comparisons (e.g. a flat
+    surrogate, all labels 0) is weighted 0.0 outright. If the target has fewer than that
+    many strict comparisons, every source is zero-weighted because target data carries no
+    ranking evidence.
 
     Remaining degenerate cases follow the single-objective module: no sources -> empty,
     fewer than two observations -> normalized uniform (no ranking evidence yet), and all
@@ -207,7 +206,11 @@ def compute_taf_r_ranking_weights(
         return np.where(np.abs(diff) <= eps, 0, np.sign(diff)).astype(np.int8)
 
     target_rank = ranking_labels(y_obs)
-    n_comparisons = target_rank.size  # M * C(n, 2)
+    target_strict = target_rank != 0
+    n_comparisons = int(np.count_nonzero(target_strict))
+    minimum = max(1, int(min_informative_pairs))
+    if n_comparisons < minimum:
+        return np.zeros(n_sources, dtype=np.float64)
 
     weights: list[float] = []
     for source in source_surrogates:
@@ -220,11 +223,13 @@ def compute_taf_r_ranking_weights(
                 f"expected {y_obs.shape}."
             )
         source_rank = ranking_labels(mu_source)
-        source_strict = int(np.count_nonzero(source_rank))
-        if source_strict < max(1, int(min_informative_pairs)):
+        source_strict = int(np.count_nonzero(source_rank[target_strict]))
+        if source_strict < minimum:
             weights.append(0.0)
             continue
-        disagreements = int(np.count_nonzero(target_rank != source_rank))
+        disagreements = int(
+            np.count_nonzero(target_rank[target_strict] != source_rank[target_strict])
+        )
         distance = float(disagreements / n_comparisons)
         weights.append(epanechnikov_weight(distance, rho))
 
