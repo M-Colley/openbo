@@ -697,6 +697,118 @@ def test_per_objective_gp_state_is_honoured(tmp_path):
     assert any("src" in str(w.message) for w in caught)
 
 
+def test_raw_space_source_is_re_expressed_in_the_unit_cube(tmp_path):
+    """Sources are recorded in the target's raw coordinates (bo_taf layout, MORunResult.x_obs)
+    but the optimizer queries the unit cube. On bounds [-5, 5]^D a raw-space source must
+    predict, at unit point u, exactly what the same source recorded in unit coordinates
+    predicts -- before the fix it was queried at raw x = u and came out anti-correlated."""
+    lo, hi = -5.0, 5.0
+    rng = np.random.default_rng(12)
+    u = rng.random((12, D))
+    y = objective(u)
+    for label, x_stored, ls in [("unit", u, 0.3), ("raw", lo + (hi - lo) * u, 0.3 * (hi - lo))]:
+        root = tmp_path / label
+        for sub in ("gp_states", "trajectories"):
+            (root / sub).mkdir(parents=True)
+        (root / "trajectories" / "src.json").write_text(
+            json.dumps({"x_values": x_stored.tolist(), "y_values": y.tolist()}), encoding="utf-8")
+        (root / "gp_states" / "src.json").write_text(json.dumps({"gp_state": {
+            "kernel_type": "matern52", "lengthscale": [ls] * D, "variance": 1.0, "noise": 1e-4,
+        }}), encoding="utf-8")
+
+    reference = _load_mo_source_surrogates(tmp_path / "unit", expected_m=M, expected_d=D)[0]
+    opt = MOTAFSequentialOptimizer(
+        MOTAFConfig(bounds=[(lo, hi)] * D, ref_point=REF, taf_run_dir=tmp_path / "raw")
+    )
+    u_query = rng.random((20, D))
+    np.testing.assert_allclose(
+        opt.source_surrogates[0].posterior_mean(u_query),
+        reference.posterior_mean(u_query),
+        rtol=1e-8, atol=1e-10,
+    )
+
+
+def _incumbent_optimizer(tmp_path, x_obs, mean_fn, ref=REF):
+    (tmp_path / "gp_states").mkdir(parents=True, exist_ok=True)
+    opt = MOTAFSequentialOptimizer(
+        MOTAFConfig(bounds=BOUNDS, ref_point=ref, taf_run_dir=tmp_path,
+                    source_reference_mode="target_incumbent")
+    )
+    opt.x_obs = np.asarray(x_obs, dtype=np.float64)
+    opt.y_obs = objective(opt.x_obs)
+    src = MOSourceTaskSurrogate(
+        name="det", mean_fn=mean_fn, pareto_front=np.array([[0.9, 0.9]]),
+        meta_features=np.zeros(1 + 2 * M),
+    )
+    return opt, src
+
+
+def test_target_incumbent_term_is_hvi_over_source_view_of_target_observations(tmp_path):
+    """Wistuba et al.'s TAF measures source improvement over max_j mu_s(x_j) on the TARGET's
+    observations. The MO reading: HVI of mu_s(x) over the Pareto front of mu_s(X_target).
+    Points the target already evaluated therefore earn (numerically) nothing."""
+    def mean_fn(x):
+        return torch.cat([x[..., 0:1] * 2.0 - 0.5, x[..., 1:2] * 2.0 - 0.5], dim=-1)
+
+    x_obs = np.random.default_rng(13).random((6, D))
+    opt, src = _incumbent_optimizer(tmp_path, x_obs, mean_fn)
+    term = opt._incumbent_source_term(src)
+
+    x = torch.tensor(np.random.default_rng(14).random((32, 1, D)), dtype=torch.double)
+    with torch.no_grad():
+        got = np.exp(term(x).numpy())
+        mu_x = mean_fn(x.squeeze(1)).numpy()
+        incumbent = mean_fn(torch.tensor(x_obs)).numpy()
+    hv_inc = compute_hypervolume(incumbent, np.array(REF))
+    for k in range(32):
+        hvi = compute_hypervolume(np.vstack([incumbent, mu_x[k][None, :]]), np.array(REF)) - hv_inc
+        if hvi > 1e-9:
+            assert got[k] == pytest.approx(hvi, rel=1e-3)
+        else:
+            assert got[k] < 1e-9
+    with torch.no_grad():
+        at_observed = np.exp(term(torch.tensor(x_obs)[:, None, :]).numpy())
+    # Observed points sitting exactly ON the incumbent front pick up tau-scale smoothing
+    # (~1e-6), still six orders below the incumbent hypervolume.
+    assert np.all(at_observed < 1e-5)
+    assert hv_inc > 1.0
+
+
+def test_target_incumbent_with_empty_front_rewards_the_dominated_box(tmp_path):
+    """No target observation predicted above the reference -> empty front, and the
+    improvement of mu(x) is its full dominated box: prod(mu(x) - ref)."""
+    def mean_fn(x):
+        return torch.cat([x[..., 0:1], x[..., 1:2]], dim=-1)
+
+    x_obs = np.zeros((3, D))  # mu = (0, 0) == ref: never strictly dominates it
+    opt, src = _incumbent_optimizer(tmp_path, x_obs, mean_fn, ref=[0.0, 0.0])
+    term = opt._incumbent_source_term(src)
+    x = torch.tensor([[[0.5, 0.4, 0.0]]], dtype=torch.double)
+    with torch.no_grad():
+        assert float(term(x).exp()) == pytest.approx(0.5 * 0.4, rel=1e-3)
+
+
+def test_run_mobo_taf_with_target_incumbent_reference(tmp_path):
+    write_source(tmp_path, "srcA", shift=0.0, seed=15)
+    write_source(tmp_path, "srcB", shift=0.2, seed=16)
+    res = run_mobo_taf(
+        objective, BOUNDS, REF, tmp_path, n_init=5, n_iter=2,
+        source_reference_mode="target_incumbent", decay_rate=0.0, seed=0,
+    )
+    assert res.y_obs.shape == (7, M)
+    assert res.final_state["source_reference_mode"] == "target_incumbent"
+    assert np.all(np.isfinite(res.hypervolume_history))
+
+
+def test_invalid_source_reference_mode_is_rejected_even_without_sources(tmp_path):
+    (tmp_path / "gp_states").mkdir(parents=True, exist_ok=True)
+    with pytest.raises(ValueError, match="source_reference_mode"):
+        MOTAFSequentialOptimizer(
+            MOTAFConfig(bounds=BOUNDS, ref_point=REF, taf_run_dir=tmp_path,
+                        source_reference_mode="best")
+        )
+
+
 def test_reference_point_must_be_multi_objective():
     with pytest.raises(ValueError):
         MOBoTorchSequentialOptimizer(MOBoTorchConfig(bounds=BOUNDS, ref_point=[-1.0]))

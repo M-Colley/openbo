@@ -19,6 +19,11 @@ Source artifacts use the same on-disk layout as ``bo_taf``::
 
 with ``y_values`` extended to shape (n, M). A malformed or unpaired artifact is warned about
 and skipped rather than aborting the run.
+
+As in ``bo_taf``, ``x_values`` (and the stored lengthscales) are in the target's RAW design
+space -- the coordinates ``MORunResult.x_obs`` holds. The optimizer works in the unit cube,
+so the loader re-expresses each source model there using the target's bounds; with bounds
+of [0, 1]^d this is the identity.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from openbo.optimizers.mobo_botorch import (
 )
 
 _KERNELS = {"matern52", "rbf"}
+_REFERENCE_MODES = {"front", "quantile", "target_incumbent"}
 
 
 @dataclass
@@ -66,6 +72,18 @@ class MOTAFConfig(MOBoTorchConfig):
     actual predictive evidence and can zero out a contradicting source, at negligible
     cost), "taf_m" (meta-feature similarity), or "taf_r_pareto" (Pareto-dominance
     agreement, kept for ablation).
+
+    ``source_reference_mode`` selects the front each source measures its hypervolume
+    improvement against: "front" (the source's own observed Pareto front; the default,
+    matching the scalar module's "best"), "quantile" (that front pruned by
+    ``_quantile_front``), or "target_incumbent" -- the Pareto front of the source's
+    predictions at the TARGET's observed points, rebuilt every iteration. The last is the
+    multi-objective reading of Wistuba et al.'s original TAF, whose source term is
+    max(mu_i(x) - max_{x_j in D_target} mu_i(x_j), 0): improvement over the target
+    incumbent as the source sees it. It anneals by itself -- once the target has sampled
+    the region a source predicts to be best, that source's improvement collapses toward
+    zero everywhere -- whereas a fixed source front keeps rewarding the source's optimum
+    no matter what the target has already learned there.
     """
 
     taf_run_dir: str | Path = ""
@@ -90,6 +108,8 @@ def _materialize_source_mean(
     x_values: NDArray[np.float64],
     y_values: NDArray[np.float64],
     gp_state: dict,
+    lower: NDArray[np.float64] | None = None,
+    scale: NDArray[np.float64] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Rebuild a source's posterior-mean function with FIXED hyperparameters.
 
@@ -100,10 +120,24 @@ def _materialize_source_mean(
     constant mean is replayed too when the artifact carries ``mean_constant`` (in
     standardized-target space); artifacts predating that field default to 0, matching
     the previous behavior.
+
+    ``x_values`` and the lengthscales are in raw design coordinates. Given the target's
+    ``lower`` and ``scale``, the model is re-expressed in the unit cube the optimizer
+    queries: inputs map to (x - lower) / scale and each lengthscale is divided by its
+    ``scale``. A stationary kernel sees inputs only through (x - x') / l, so this is the
+    SAME function, not a refit. Without them the coordinates are used as stored.
     """
-    x_t = torch.tensor(np.asarray(x_values, dtype=np.float64), dtype=torch.double)
+    x_np = np.asarray(x_values, dtype=np.float64)
+    d = x_np.shape[1]
+    if lower is None or scale is None:
+        lower_np, scale_np = np.zeros(d), np.ones(d)
+    else:
+        lower_np = np.asarray(lower, dtype=np.float64).reshape(-1)
+        scale_np = np.asarray(scale, dtype=np.float64).reshape(-1)
+        if lower_np.shape != (d,) or scale_np.shape != (d,):
+            raise ValueError(f"lower and scale must have length {d}.")
+    x_t = torch.tensor((x_np - lower_np) / scale_np, dtype=torch.double)
     y_t = torch.tensor(np.asarray(y_values, dtype=np.float64), dtype=torch.double)
-    n, d = x_t.shape
     m = int(y_t.shape[1])
 
     def _validated(entry: dict, label: str) -> tuple[str, NDArray[np.float64], float, float, float]:
@@ -161,7 +195,7 @@ def _materialize_source_mean(
         )
         with torch.no_grad():
             gp.covar_module.base_kernel.lengthscale = torch.tensor(
-                np.broadcast_to(lengthscale, (d,)).copy(), dtype=torch.double
+                np.broadcast_to(lengthscale, (d,)) / scale_np, dtype=torch.double
             )
             gp.covar_module.outputscale = torch.tensor(variance, dtype=torch.double)
             gp.likelihood.noise = torch.tensor(noise, dtype=torch.double)
@@ -181,12 +215,16 @@ def _load_mo_source_surrogates(
     taf_run_dir: str | Path,
     expected_m: int | None = None,
     expected_d: int | None = None,
+    lower: NDArray[np.float64] | None = None,
+    scale: NDArray[np.float64] | None = None,
 ) -> list[MOSourceTaskSurrogate]:
     """Reconstruct MO source surrogates from saved gp_states + trajectories.
 
     Mirrors ``bo_taf._load_source_surrogates``, including its warn-and-skip contract: a
     missing pair member or a present-but-malformed file is skipped with a warning rather
-    than raising an opaque error mid-load.
+    than raising an opaque error mid-load. ``lower``/``scale`` are the target's bounds;
+    when given, each returned ``mean_fn`` takes unit-cube inputs (see
+    ``_materialize_source_mean``).
     """
     run_dir = Path(taf_run_dir)
     gp_states_dir = run_dir / "gp_states"
@@ -232,7 +270,9 @@ def _load_mo_source_surrogates(
                     f"source has M={y_values.shape[1]}, target expects M={expected_m}"
                 )
 
-            mean_fn = _materialize_source_mean(x_values, y_values, gp_state)
+            mean_fn = _materialize_source_mean(
+                x_values, y_values, gp_state, lower=lower, scale=scale
+            )
             front = traj_payload.get("pareto_front")
             front_arr = (
                 np.asarray(front, dtype=np.float64)
@@ -279,8 +319,17 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
         self.last_source_weights: NDArray[np.float64] = np.zeros(0, dtype=np.float64)
         self.last_target_weight: float = float(config.target_weight)
 
+        if config.source_reference_mode not in _REFERENCE_MODES:
+            raise ValueError(
+                f"source_reference_mode must be one of {sorted(_REFERENCE_MODES)}."
+            )
+
         self.source_surrogates = _load_mo_source_surrogates(
-            config.taf_run_dir, expected_m=self.m, expected_d=self.d
+            config.taf_run_dir,
+            expected_m=self.m,
+            expected_d=self.d,
+            lower=self.lower,
+            scale=self.scale,
         )
 
         source_meta_map = {} if config.source_meta_features is None else {
@@ -304,14 +353,15 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
                 source.reference_front = _quantile_front(
                     source.pareto_front, config.source_reference_quantile
                 )
-            elif config.source_reference_mode != "front":
-                raise ValueError("source_reference_mode must be 'front' or 'quantile'.")
 
         # A source whose front cannot strictly dominate the reference point offers zero
         # hypervolume improvement, and build_source_hvi_term raises for it. Honor the
         # loader's warn-and-skip contract instead of aborting the whole run at
         # construction, dropping the surrogate as well so weights stay aligned with
         # terms; the existing zero-source degradation handles the all-dropped case.
+        # The check also applies under "target_incumbent" (whose terms are rebuilt every
+        # iteration): a source that never observed a point clearing the reference is
+        # screened out the same way in every mode.
         kept_surrogates = []
         source_terms = []
         for s in self.source_surrogates:
@@ -365,6 +415,21 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
         source_meta = np.stack([s.meta_features for s in self.source_surrogates], axis=0)
         return compute_taf_m_weights(source_meta, target_meta, rho=self.config.rho)
 
+    def _incumbent_source_term(self, source: MOSourceTaskSurrogate):
+        """Source HVI term against the target's observations as this source predicts them.
+
+        The reference front is the Pareto front of mu_s(X_target), so the term rewards only
+        what the source expects to beat the target's best so far (Wistuba et al.'s
+        y^{max}_{t-1}, lifted to fronts). An empty front -- no observation predicted to
+        clear the reference point -- leaves the full dominated box of mu_s(x) as the
+        improvement, which is the hypervolume of a single new point.
+        """
+        x_unit = (self.x_obs - self.lower) / self.scale
+        mu = source.posterior_mean(x_unit)
+        mu = mu[np.all(mu > self.ref_point, axis=1)]
+        front = pareto_front(mu) if mu.shape[0] > 0 else np.empty((0, self.m))
+        return build_source_hvi_term(source, self.ref_point, front=front)
+
     def _decay_factor(self) -> float:
         """Current gamma(t); counts suggest() calls, matching the warmup counter."""
         return population_decay(
@@ -397,7 +462,13 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
             # No usable source: the acquisition IS plain qLogNEHVI, bit for bit.
             return target_term
 
-        source_terms = list(self._source_terms)
+        if self.config.source_reference_mode == "target_incumbent":
+            source_terms = [
+                self._incumbent_source_term(s) if w > 0.0 else self._source_terms[k]
+                for k, (s, w) in enumerate(zip(self.source_surrogates, source_weights))
+            ]
+        else:
+            source_terms = list(self._source_terms)
         return _CompositeTAFEHVI(
             target_term=target_term,
             source_terms=source_terms,
@@ -424,6 +495,7 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
             "source_names": [s.name for s in self.source_surrogates],
             "taf_weight_mode": self.config.taf_weight_mode,
             "taf_rho": float(self.config.rho),
+            "source_reference_mode": self.config.source_reference_mode,
             "last_source_weights": [float(w) for w in self.last_source_weights],
             "last_target_weight": float(self.last_target_weight),
             "source_only_warmup_iters": int(self.config.source_only_warmup_iters),
@@ -489,11 +561,15 @@ def population_decay(iteration: int, decay_start_iter: int, decay_rate: float) -
 def _quantile_front(
     front: NDArray[np.float64], quantile: float
 ) -> NDArray[np.float64]:
-    """Prune a source front to its stronger points.
+    """Prune a source front to the points reaching the per-objective quantile somewhere.
 
-    Multi-objective reading of ``bo_taf``'s ``source_reference_mode='quantile'``: instead of
-    "beat this source's own 90th percentile" on a scalar, keep only front points that clear
-    the per-objective quantile, so the source rewards genuinely strong regions.
+    Loose multi-objective reading of ``bo_taf``'s ``source_reference_mode='quantile'``,
+    which lowers the scalar bar from the source's best to its 90th percentile. Here the
+    bar is lowered unevenly: a point survives if it reaches the quantile in ANY
+    objective, which keeps the front's extremes and drops its interior. The reference
+    surface therefore sags between the extremes -- the source rewards its own trade-off
+    interior (the knee) generously while the extremes stay as hard to beat as under
+    "front". With few front points it can keep just the M end points.
     """
     front = np.asarray(front, dtype=np.float64)
     if front.ndim != 2 or front.shape[0] == 0:
@@ -519,6 +595,7 @@ def run_mobo_taf(
     decay_start_iter: int = 2,
     decay_rate: float = 0.3,
     seed: int | None = 0,
+    source_reference_mode: str = "front",
 ) -> MORunResult:
     """Run multi-objective BO with the TAF-EHVI acquisition and saved source surrogates.
 
@@ -529,6 +606,7 @@ def run_mobo_taf(
     zero, so late suggestions stay source-driven and final-checkpoint hypervolume falls
     below plain MOBO — the effect gamma(t) (Liao et al., CHI'24, Eq. 6) exists to fix.
     Pass ``decay_rate=0.0`` explicitly for a no-decay ablation.
+    ``source_reference_mode`` is documented on ``MOTAFConfig``.
     """
     optimizer = MOTAFSequentialOptimizer(
         MOTAFConfig(
@@ -543,6 +621,7 @@ def run_mobo_taf(
             source_only_warmup_iters=source_only_warmup_iters,
             decay_start_iter=decay_start_iter,
             decay_rate=decay_rate,
+            source_reference_mode=source_reference_mode,
             seed=seed,
         )
     )

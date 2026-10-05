@@ -620,7 +620,10 @@ clearly worse than any solution you care about.
 Source artifacts use the same directory layout as `bo_taf` (`gp_states/<task>.json` +
 `trajectories/<task>.json`), with `y_values` extended to shape `(n, M)`, optionally a
 stored `pareto_front`, and `gp_state` either as one flat hyperparameter set or with
-per-objective entries under `"objectives": [...]`.
+per-objective entries under `"objectives": [...]`. As in `bo_taf`, `x_values` and the
+stored lengthscales are in the target's raw design coordinates (what `result.x_obs`
+holds); the optimizer maps each source model into its unit cube using the target's
+`bounds`, which is a no-op for `[0, 1]^d` bounds.
 
 ```python
 from openbo.optimizers.mobo_taf import run_mobo_taf
@@ -638,6 +641,15 @@ result = run_mobo_taf(
 Advanced knobs (source-only warmup, population-weight decay following Liao et al.
 CHI '24 Eq. 6, quantile source references) live on `MOTAFConfig`; construct
 `MOTAFSequentialOptimizer` directly for ask/tell use.
+
+`source_reference_mode` sets what a source's hypervolume improvement is measured
+against: `"front"` (default) uses the source's own observed Pareto front, and
+`"target_incumbent"` uses the Pareto front of the source's *predictions at the target's
+observed points*, rebuilt every iteration. The latter is the multi-objective form of the
+original TAF (Wistuba et al., 2018), whose source term is improvement over the target's
+best so far as the source predicts it, so it fades on its own once the target has
+sampled where the source points. `"quantile"` is also available but keeps only the
+front's extremes (see `_quantile_front`).
 
 ### How MO-TAF weights sources
 

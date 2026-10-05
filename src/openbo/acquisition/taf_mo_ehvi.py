@@ -333,6 +333,7 @@ def compute_taf_r_pareto_weights(
 def build_source_hvi_term(
     source: MOSourceTaskSurrogate,
     ref_point: NDArray[np.float64],
+    front: NDArray[np.float64] | None = None,
 ) -> qLogExpectedHypervolumeImprovement:
     """Build the deterministic log-hypervolume-improvement term for one source.
 
@@ -342,9 +343,16 @@ def build_source_hvi_term(
     of ``softplus(mu_i(x) - ref_i)``. A ``StochasticSampler`` of size 1 is passed explicitly:
     the lazily-created default draws 128 identical copies of a deterministic mean, and a
     normal sampler is rejected outright by the ensemble posterior.
+
+    ``front`` overrides the source's stored front (``source.front()``). The stored front
+    must have a point dominating the reference -- otherwise the source is unusable and
+    this raises -- but an explicit front may legitimately be empty (e.g. no target
+    observation is predicted to clear the reference), leaving the full dominated box of
+    mu(x) as the improvement.
     """
+    explicit_front = front is not None
     ref = np.asarray(ref_point, dtype=np.float64)
-    front = np.asarray(source.front(), dtype=np.float64)
+    front = np.asarray(source.front() if front is None else front, dtype=np.float64)
     if front.ndim != 2 or front.shape[1] != ref.shape[0]:
         raise ValueError(
             f"source '{source.name}' front must have shape (P, {ref.shape[0]}), got {front.shape}."
@@ -356,7 +364,7 @@ def build_source_hvi_term(
     # so the partitioning is built from meaningful cells only.
     keep = torch.all(front_t > ref_t, dim=-1)
     front_t = front_t[keep]
-    if front_t.shape[0] == 0:
+    if front_t.shape[0] == 0 and not explicit_front:
         raise ValueError(
             f"source '{source.name}' has no front point dominating the reference point."
         )
