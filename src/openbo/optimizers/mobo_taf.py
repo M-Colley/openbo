@@ -19,6 +19,11 @@ Source artifacts use the same on-disk layout as ``bo_taf``::
 
 with ``y_values`` extended to shape (n, M). A malformed or unpaired artifact is warned about
 and skipped rather than aborting the run.
+
+The model library is BoTorch or botorch-rust (``BO_MODEL_LIBRARY``, see
+``openbo.model_library``; ``MODEL_LIBRARY`` states which one is bound). The source models are
+built in the optimizer's library; on botorch-rust the blend of the target and source terms is
+the native ``WeightedLogMeanExp`` (``_CompositeTAFEHVI``'s formula, evaluated in Rust).
 """
 
 from __future__ import annotations
@@ -27,15 +32,13 @@ import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import torch
-from botorch.models import ModelListGP, SingleTaskGP
-from botorch.models.transforms.outcome import Standardize
-from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
 from numpy.typing import NDArray
 
+from openbo import model_library as _model_library
 from openbo.acquisition.taf_mo_ehvi import (
     MOSourceTaskSurrogate,
     build_source_hvi_term,
@@ -52,6 +55,19 @@ from openbo.optimizers.mobo_botorch import (
     MOObjective,
     pareto_front,
 )
+
+# The library these names are bound from ("botorch" or "botorch_rs"), after fallbacks.
+MODEL_LIBRARY = _model_library.MODEL_LIBRARY
+_LIB = _model_library.namespace(MODEL_LIBRARY)
+ModelListGP = _LIB.ModelListGP
+SingleTaskGP = _LIB.SingleTaskGP
+Standardize = _LIB.Standardize
+MaternKernel = _LIB.MaternKernel
+RBFKernel = _LIB.RBFKernel
+ScaleKernel = _LIB.ScaleKernel
+WeightedLogMeanExp = _LIB.WeightedLogMeanExp
+optimize_acqf = _LIB.optimize_acqf
+fit_gpytorch_mll = _LIB.fit_gpytorch_mll
 
 _KERNELS = {"matern52", "rbf"}
 
@@ -90,8 +106,25 @@ def _materialize_source_mean(
     x_values: NDArray[np.float64],
     y_values: NDArray[np.float64],
     gp_state: dict,
+    library: str | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Rebuild a source's posterior-mean function with FIXED hyperparameters.
+    """A source's posterior-mean function: ``model_list.posterior(x).mean`` of
+    ``_materialize_source_model`` (see there)."""
+    model_list = _materialize_source_model(x_values, y_values, gp_state, library=library)
+
+    def mean_fn(x: torch.Tensor) -> torch.Tensor:
+        return model_list.posterior(x).mean
+
+    return mean_fn
+
+
+def _materialize_source_model(
+    x_values: NDArray[np.float64],
+    y_values: NDArray[np.float64],
+    gp_state: dict,
+    library: str | None = None,
+) -> Any:
+    """Rebuild a source's ``ModelListGP`` with FIXED hyperparameters.
 
     Mirrors ``bo_taf``'s use of ``GPScratch(optimize_hyperparameters=False).fit(...)``: the
     stored hyperparameters are replayed and the model is conditioned on the trajectory, but
@@ -99,8 +132,10 @@ def _materialize_source_mean(
     ``SingleTaskGP`` covariance is a bare kernel with no outputscale to set. The fitted
     constant mean is replayed too when the artifact carries ``mean_constant`` (in
     standardized-target space); artifacts predating that field default to 0, matching
-    the previous behavior.
+    the previous behavior. ``library`` ("botorch" or "botorch_rs"; default
+    ``MODEL_LIBRARY``) builds the models.
     """
+    lib = _LIB if library in (None, MODEL_LIBRARY) else _model_library.namespace(library)
     x_t = torch.tensor(np.asarray(x_values, dtype=np.float64), dtype=torch.double)
     y_t = torch.tensor(np.asarray(y_values, dtype=np.float64), dtype=torch.double)
     n, d = x_t.shape
@@ -148,16 +183,16 @@ def _materialize_source_mean(
     for j in range(m):
         kernel_type, lengthscale, variance, noise, mean_constant = hyper[j]
         base = (
-            MaternKernel(nu=2.5, ard_num_dims=d)
+            lib.MaternKernel(nu=2.5, ard_num_dims=d)
             if kernel_type == "matern52"
-            else RBFKernel(ard_num_dims=d)
+            else lib.RBFKernel(ard_num_dims=d)
         )
-        covar = ScaleKernel(base)
-        gp = SingleTaskGP(
+        covar = lib.ScaleKernel(base)
+        gp = lib.SingleTaskGP(
             x_t,
             y_t[:, j : j + 1],
             covar_module=covar,
-            outcome_transform=Standardize(m=1),
+            outcome_transform=lib.Standardize(m=1),
         )
         with torch.no_grad():
             gp.covar_module.base_kernel.lengthscale = torch.tensor(
@@ -169,24 +204,21 @@ def _materialize_source_mean(
         gp.eval()
         models.append(gp)
 
-    model_list = ModelListGP(*models)
-
-    def mean_fn(x: torch.Tensor) -> torch.Tensor:
-        return model_list.posterior(x).mean
-
-    return mean_fn
+    return lib.ModelListGP(*models)
 
 
 def _load_mo_source_surrogates(
     taf_run_dir: str | Path,
     expected_m: int | None = None,
     expected_d: int | None = None,
+    library: str | None = None,
 ) -> list[MOSourceTaskSurrogate]:
     """Reconstruct MO source surrogates from saved gp_states + trajectories.
 
     Mirrors ``bo_taf._load_source_surrogates``, including its warn-and-skip contract: a
     missing pair member or a present-but-malformed file is skipped with a warning rather
-    than raising an opaque error mid-load.
+    than raising an opaque error mid-load. The source models are built in ``library``
+    (default ``MODEL_LIBRARY``).
     """
     run_dir = Path(taf_run_dir)
     gp_states_dir = run_dir / "gp_states"
@@ -232,7 +264,8 @@ def _load_mo_source_surrogates(
                     f"source has M={y_values.shape[1]}, target expects M={expected_m}"
                 )
 
-            mean_fn = _materialize_source_mean(x_values, y_values, gp_state)
+            model_list = _materialize_source_model(x_values, y_values, gp_state, library=library)
+            mean_fn = _posterior_mean_fn(model_list)
             front = traj_payload.get("pareto_front")
             front_arr = (
                 np.asarray(front, dtype=np.float64)
@@ -254,10 +287,18 @@ def _load_mo_source_surrogates(
                 mean_fn=mean_fn,
                 pareto_front=front_arr,
                 meta_features=mo_meta_features(x_values, y_values),
+                model=model_list,
             )
         )
 
     return surrogates
+
+
+def _posterior_mean_fn(model_list: Any) -> Callable[[torch.Tensor], torch.Tensor]:
+    def mean_fn(x: torch.Tensor) -> torch.Tensor:
+        return model_list.posterior(x).mean
+
+    return mean_fn
 
 
 class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
@@ -280,7 +321,7 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
         self.last_target_weight: float = float(config.target_weight)
 
         self.source_surrogates = _load_mo_source_surrogates(
-            config.taf_run_dir, expected_m=self.m, expected_d=self.d
+            config.taf_run_dir, expected_m=self.m, expected_d=self.d, library=self.model_library
         )
 
         source_meta_map = {} if config.source_meta_features is None else {
@@ -316,7 +357,9 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
         source_terms = []
         for s in self.source_surrogates:
             try:
-                term = build_source_hvi_term(s, self.ref_point)
+                term = build_source_hvi_term(
+                    s, self.ref_point, library=self.model_library, dim=self.d
+                )
             except ValueError as exc:
                 warnings.warn(
                     f"MO TAF source '{s.name}': cannot build its hypervolume term "
@@ -398,6 +441,18 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
             return target_term
 
         source_terms = list(self._source_terms)
+        if self.model_library == _model_library.BOTORCH_RS:
+            # taf_mo_ehvi_acquisition's blend, natively: the terms with a positive weight
+            # (a non-positive weight leaves both the numerator and the denominator).
+            terms, weights = [], []
+            if target_weight > 0.0:
+                terms.append(target_term)
+                weights.append(target_weight)
+            for term, w in zip(source_terms, source_weights):
+                if float(w) > 0.0:
+                    terms.append(term)
+                    weights.append(float(w))
+            return self._lib.WeightedLogMeanExp(terms, weights)
         return _CompositeTAFEHVI(
             target_term=target_term,
             source_terms=source_terms,
@@ -431,6 +486,7 @@ class MOTAFSequentialOptimizer(MOBoTorchSequentialOptimizer):
             "decay_start_iter": int(self.config.decay_start_iter),
             "decay_rate": float(self.config.decay_rate),
             "last_decay_factor": self._decay_factor(),
+            "model_library": self.model_library,
         }
         return base
 
@@ -517,8 +573,10 @@ def run_mobo_taf(
     target_weight: float = 1.0,
     source_only_warmup_iters: int = 0,
     seed: int | None = 0,
+    model_library: str | None = None,
 ) -> MORunResult:
-    """Run multi-objective BO with the TAF-EHVI acquisition and saved source surrogates."""
+    """Run multi-objective BO with the TAF-EHVI acquisition and saved source surrogates;
+    ``model_library`` as in ``MOBoTorchConfig``."""
     optimizer = MOTAFSequentialOptimizer(
         MOTAFConfig(
             bounds=bounds,
@@ -531,6 +589,7 @@ def run_mobo_taf(
             target_weight=target_weight,
             source_only_warmup_iters=source_only_warmup_iters,
             seed=seed,
+            model_library=model_library,
         )
     )
     optimizer.bootstrap(objective)

@@ -34,6 +34,11 @@ than merely convenient: the non-log hypervolume improvement of a dominated candi
 identically zero with a zero gradient, which strands a gradient-based acquisition optimizer,
 whereas the log form keeps a finite, monotonically decreasing "how far behind the front"
 signal.
+
+A source term is qLogEHVI on ``PosteriorMeanModel`` of the source's ``ModelListGP``, built
+from the model library bound by ``BO_MODEL_LIBRARY`` (BoTorch or botorch-rust, see
+``openbo.model_library``; ``MODEL_LIBRARY`` states which). On botorch-rust the blend itself is
+the native ``WeightedLogMeanExp`` (see ``openbo.optimizers.mobo_taf``).
 """
 
 from __future__ import annotations
@@ -41,20 +46,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+from typing import Any
+
 import numpy as np
 import torch
-from botorch.acquisition.multi_objective.logei import (
-    qLogExpectedHypervolumeImprovement,
-)
-from botorch.models.deterministic import GenericDeterministicModel
-from botorch.sampling.stochastic_samplers import StochasticSampler
-from botorch.utils.multi_objective.box_decompositions.non_dominated import (
-    NondominatedPartitioning,
-)
 from numpy.typing import NDArray
+
+from openbo import model_library as _model_library
 
 # Reused verbatim from the single-objective module so both stay in lockstep.
 from openbo.acquisition.taf import compute_taf_m_weights, epanechnikov_weight
+
+# The library these names are bound from ("botorch" or "botorch_rs"), after fallbacks.
+MODEL_LIBRARY = _model_library.MODEL_LIBRARY
+_LIB = _model_library.namespace(MODEL_LIBRARY)
+qLogExpectedHypervolumeImprovement = _LIB.qLogExpectedHypervolumeImprovement
+PosteriorMeanModel = _LIB.PosteriorMeanModel
+GenericDeterministicModel = _LIB.GenericDeterministicModel
+StochasticSampler = _LIB.StochasticSampler
+NondominatedPartitioning = _LIB.NondominatedPartitioning
 
 __all__ = [
     "MOSourceTaskSurrogate",
@@ -80,8 +90,11 @@ _FAT = True
 class MOSourceTaskSurrogate:
     """Reconstructed multi-objective source-task surrogate used by TAF-EHVI.
 
-    Counterpart of ``SourceTaskSurrogate``. ``mean_fn`` must be a differentiable torch
-    callable mapping ``(..., d) -> (..., M)``; only the mean is ever consulted.
+    Counterpart of ``SourceTaskSurrogate``. ``mean_fn`` maps ``(..., d) -> (..., M)``; only
+    the mean is ever consulted. ``model`` (optional) is the ``ModelListGP`` whose posterior mean
+    ``mean_fn`` computes: the source's hypervolume term is then built on
+    ``PosteriorMeanModel(model)``, else on ``GenericDeterministicModel(mean_fn)``, which needs a
+    ``mean_fn`` differentiable with torch.autograd.
     """
 
     name: str
@@ -89,6 +102,7 @@ class MOSourceTaskSurrogate:
     pareto_front: NDArray[np.float64]
     meta_features: NDArray[np.float64]
     reference_front: NDArray[np.float64] | None = None
+    model: Any = None
 
     def front(self) -> NDArray[np.float64]:
         """Front the source measures improvement against."""
@@ -338,15 +352,24 @@ def compute_taf_r_pareto_weights(
 def build_source_hvi_term(
     source: MOSourceTaskSurrogate,
     ref_point: NDArray[np.float64],
-) -> qLogExpectedHypervolumeImprovement:
+    library: str | None = None,
+    dim: int | None = None,
+) -> Any:
     """Build the deterministic log-hypervolume-improvement term for one source.
 
-    The source's mean function is wrapped in a ``GenericDeterministicModel``, whose posterior
-    has exactly zero variance, so expected hypervolume improvement collapses to the plain
-    hypervolume improvement of the predicted objective vector -- the multi-objective reading
-    of ``softplus(mu_i(x) - ref_i)``. A ``StochasticSampler`` of size 1 is passed explicitly:
-    the lazily-created default draws 128 identical copies of a deterministic mean, and a
-    normal sampler is rejected outright by the ensemble posterior.
+    The source's posterior mean is a deterministic model -- ``PosteriorMeanModel`` of its
+    ``ModelListGP`` (``source.model``), or ``GenericDeterministicModel(mean_fn)`` for a
+    surrogate given by its mean function only -- whose posterior has exactly zero variance,
+    so expected hypervolume improvement collapses to the plain hypervolume improvement of
+    the predicted objective vector -- the multi-objective reading of
+    ``softplus(mu_i(x) - ref_i)``. Both models give identical values (the posterior mean
+    either way). A ``StochasticSampler`` of size 1 is passed explicitly: the lazily-created
+    default draws 128 identical copies of a deterministic mean, and BoTorch rejects a normal
+    sampler outright for the ensemble posterior.
+
+    ``library`` ("botorch" or "botorch_rs"; default ``MODEL_LIBRARY``) must be the library of
+    ``source.model``. ``dim``, the input dimension, lets botorch-rust evaluate a
+    ``GenericDeterministicModel``; without it such a term is built with BoTorch.
     """
     ref = np.asarray(ref_point, dtype=np.float64)
     front = np.asarray(source.front(), dtype=np.float64)
@@ -366,13 +389,25 @@ def build_source_hvi_term(
             f"source '{source.name}' has no front point dominating the reference point."
         )
 
-    model = GenericDeterministicModel(source.mean_fn, num_outputs=int(ref.shape[0]))
-    partitioning = NondominatedPartitioning(ref_point=ref_t, Y=front_t)
-    return qLogExpectedHypervolumeImprovement(
+    lib = _LIB if library in (None, MODEL_LIBRARY) else _model_library.namespace(library)
+    if source.model is not None:
+        model = lib.PosteriorMeanModel(source.model)
+    elif lib.library == _model_library.BOTORCH_RS and dim is not None:
+        model = lib.GenericDeterministicModel(
+            source.mean_fn, num_outputs=int(ref.shape[0]), dim=int(dim)
+        )
+    else:
+        # A mean function of unknown input dimension: BoTorch's model (botorch-rust's
+        # WeightedLogMeanExp evaluates such a term as a torch callable).
+        if lib.library != _model_library.BOTORCH:
+            lib = _model_library.namespace(_model_library.BOTORCH)
+        model = lib.GenericDeterministicModel(source.mean_fn, num_outputs=int(ref.shape[0]))
+    partitioning = lib.NondominatedPartitioning(ref_point=ref_t, Y=front_t)
+    return lib.qLogExpectedHypervolumeImprovement(
         model=model,
         ref_point=ref_t.tolist(),
         partitioning=partitioning,
-        sampler=StochasticSampler(sample_shape=torch.Size([1])),
+        sampler=lib.StochasticSampler(sample_shape=torch.Size([1])),
         tau_max=_TAU_MAX,
         fat=_FAT,
     )

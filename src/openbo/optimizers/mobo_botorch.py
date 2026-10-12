@@ -7,6 +7,12 @@ non-dominated set relative to a fixed reference point.
 
 Conventions (shared with the rest of openbo): every objective is MAXIMIZED, and the
 reference point must be dominated by any point that should contribute hypervolume.
+
+The model library is BoTorch or botorch-rust (``BO_MODEL_LIBRARY``, see
+``openbo.model_library``): the BoTorch names below are bound from the library chosen when
+openbo is imported (``MODEL_LIBRARY``), and ``MOBoTorchConfig.model_library`` overrides it for
+one optimizer. On botorch-rust, suggestions are seeded through ``optimize_acqf``'s
+``options["seed"]`` (and the fit's ``seed``) instead of torch's random number generator.
 """
 
 from __future__ import annotations
@@ -16,18 +22,23 @@ from typing import Callable
 
 import numpy as np
 import torch
-from botorch.acquisition.multi_objective.logei import (
-    qLogNoisyExpectedHypervolumeImprovement,
-)
-from botorch.fit import fit_gpytorch_mll
-from botorch.models import SingleTaskGP
-from botorch.models.transforms.outcome import Standardize
-from botorch.optim import optimize_acqf
-from botorch.sampling.normal import SobolQMCNormalSampler
-from botorch.utils.multi_objective.hypervolume import Hypervolume
-from botorch.utils.multi_objective.pareto import is_non_dominated
-from gpytorch.mlls import ExactMarginalLogLikelihood
 from numpy.typing import NDArray
+
+from openbo import model_library as _model_library
+
+# The library these names are bound from ("botorch" or "botorch_rs"), after fallbacks.
+MODEL_LIBRARY = _model_library.MODEL_LIBRARY
+_LIB = _model_library.namespace(MODEL_LIBRARY)
+qLogNoisyExpectedHypervolumeImprovement = _LIB.qLogNoisyExpectedHypervolumeImprovement
+fit_gpytorch_mll = _LIB.fit_gpytorch_mll
+SingleTaskGP = _LIB.SingleTaskGP
+ModelListGP = _LIB.ModelListGP
+Standardize = _LIB.Standardize
+optimize_acqf = _LIB.optimize_acqf
+SobolQMCNormalSampler = _LIB.SobolQMCNormalSampler
+Hypervolume = _LIB.Hypervolume
+is_non_dominated = _LIB.is_non_dominated
+ExactMarginalLogLikelihood = _LIB.ExactMarginalLogLikelihood
 
 # A multi-objective objective maps (n, d) -> (n, M).
 MOObjective = Callable[[NDArray[np.float64]], NDArray[np.float64]]
@@ -53,11 +64,13 @@ class MORunResult:
 def compute_hypervolume(
     y: NDArray[np.float64],
     ref_point: NDArray[np.float64],
+    library: str | None = None,
 ) -> float:
     """Hypervolume of the non-dominated subset of ``y`` w.r.t. ``ref_point`` (maximization).
 
     Points that do not strictly dominate the reference point contribute nothing, so an
-    empty or entirely-dominated set yields 0.0 rather than raising.
+    empty or entirely-dominated set yields 0.0 rather than raising. ``library`` ("botorch"
+    or "botorch_rs"; default ``MODEL_LIBRARY``) computes it; both give the same values.
     """
     y = np.asarray(y, dtype=np.float64)
     ref_point = np.asarray(ref_point, dtype=np.float64)
@@ -75,20 +88,23 @@ def compute_hypervolume(
     if above.shape[0] == 0:
         return 0.0
 
+    lib = _LIB if library in (None, MODEL_LIBRARY) else _model_library.namespace(library)
     y_t = torch.tensor(above, dtype=torch.double)
-    front = y_t[is_non_dominated(y_t)]
-    return float(Hypervolume(ref_point=torch.tensor(ref_point, dtype=torch.double)).compute(front))
+    front = y_t[lib.is_non_dominated(y_t)]
+    hv = lib.Hypervolume(ref_point=torch.tensor(ref_point, dtype=torch.double))
+    return float(hv.compute(front))
 
 
-def pareto_front(y: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Non-dominated rows of ``y`` (maximization)."""
+def pareto_front(y: NDArray[np.float64], library: str | None = None) -> NDArray[np.float64]:
+    """Non-dominated rows of ``y`` (maximization); ``library`` as in ``compute_hypervolume``."""
     y = np.asarray(y, dtype=np.float64)
     if y.ndim != 2:
         raise ValueError("y must have shape (n, M).")
     if y.shape[0] == 0:
         return y.reshape(0, y.shape[1] if y.ndim == 2 else 0)
+    lib = _LIB if library in (None, MODEL_LIBRARY) else _model_library.namespace(library)
     y_t = torch.tensor(y, dtype=torch.double)
-    return y_t[is_non_dominated(y_t)].cpu().numpy().astype(np.float64)
+    return y_t[lib.is_non_dominated(y_t)].cpu().numpy().astype(np.float64)
 
 
 @dataclass
@@ -102,6 +118,9 @@ class MOBoTorchConfig:
     raw_samples: int = 64
     mc_samples: int = 128
     seed: int | None = 0
+    # "botorch", "botorch_rs" (or "botorch-rust") or "auto"; None: the library chosen with
+    # BO_MODEL_LIBRARY when openbo was imported (openbo.model_library.MODEL_LIBRARY).
+    model_library: str | None = None
 
 
 class MOBoTorchSequentialOptimizer:
@@ -116,6 +135,15 @@ class MOBoTorchSequentialOptimizer:
         # A None seed stays nondeterministic rather than being silently pinned to 0.
         self._torch_seed = config.seed
         self._suggest_calls = 0
+        # The model library of this optimizer (and how it was chosen); never switched later.
+        self.model_library, self.model_library_reason = _model_library.select(
+            config.model_library
+        )
+        self._lib = (
+            _LIB
+            if self.model_library == MODEL_LIBRARY
+            else _model_library.namespace(self.model_library)
+        )
 
         self.d = len(config.bounds)
         if self.d == 0:
@@ -157,19 +185,27 @@ class MOBoTorchSequentialOptimizer:
         )
         return train_x, train_y, bounds_t
 
-    def _fit_model(self, train_x: torch.Tensor, train_y: torch.Tensor) -> SingleTaskGP:
-        model = SingleTaskGP(train_x, train_y, outcome_transform=Standardize(m=self.m))
-        mll = ExactMarginalLogLikelihood(model.likelihood, model)
-        fit_gpytorch_mll(mll)
+    def _fit_model(
+        self, train_x: torch.Tensor, train_y: torch.Tensor, seed: int | None = None
+    ) -> SingleTaskGP:
+        """Fit the target GP; ``seed`` seeds botorch-rust's fitting retries (BoTorch draws
+        them from torch's generator, which ``suggest`` seeds)."""
+        lib = self._lib
+        model = lib.SingleTaskGP(train_x, train_y, outcome_transform=lib.Standardize(m=self.m))
+        mll = lib.ExactMarginalLogLikelihood(model.likelihood, model)
+        if self.model_library == _model_library.BOTORCH_RS:
+            lib.fit_gpytorch_mll(mll, seed=seed)
+        else:
+            lib.fit_gpytorch_mll(mll)
         return model
 
     def _build_acquisition(self, model: SingleTaskGP, train_x: torch.Tensor):
         """Target-only qLogNEHVI. Overridden by the TAF variant to blend in sources."""
-        sampler = SobolQMCNormalSampler(
+        sampler = self._lib.SobolQMCNormalSampler(
             sample_shape=torch.Size([self.config.mc_samples]),
             seed=None if self._torch_seed is None else int(self._torch_seed),
         )
-        return qLogNoisyExpectedHypervolumeImprovement(
+        return self._lib.qLogNoisyExpectedHypervolumeImprovement(
             model=model,
             ref_point=self.ref_point.tolist(),
             X_baseline=train_x,
@@ -183,6 +219,27 @@ class MOBoTorchSequentialOptimizer:
             raise ValueError("Cannot suggest without observations. Call bootstrap() first.")
 
         train_x, train_y, bounds_t = self._unit_train_tensors()
+        if self.model_library == _model_library.BOTORCH_RS:
+            # botorch-rust does not use torch's generator: the per-call seed (base + call
+            # index) goes to the fit and to optimize_acqf (raw samples and the choice of
+            # initial conditions); the sampler is seeded as on BoTorch.
+            seed = (
+                None if self._torch_seed is None else int(self._torch_seed) + self._suggest_calls
+            )
+            self._suggest_calls += 1
+            model = self._fit_model(train_x, train_y, seed=seed)
+            acq = self._build_acquisition(model, train_x)
+            candidate, _ = self._lib.optimize_acqf(
+                acq_function=acq,
+                bounds=bounds_t,
+                q=1,
+                num_restarts=self.config.num_restarts,
+                raw_samples=self.config.raw_samples,
+                options={"seed": seed},
+            )
+            x_next_unit = candidate.detach().cpu().numpy().astype(np.float64)
+            return x_next_unit * self.scale + self.lower
+
         # Isolate torch RNG use to this call: fork_rng saves/restores the CPU
         # generator, and a per-call seed (base + call index) keeps runs reproducible
         # and each iteration distinct without leaking into other sessions.
@@ -195,7 +252,7 @@ class MOBoTorchSequentialOptimizer:
 
             model = self._fit_model(train_x, train_y)
             acq = self._build_acquisition(model, train_x)
-            candidate, _ = optimize_acqf(
+            candidate, _ = self._lib.optimize_acqf(
                 acq_function=acq,
                 bounds=bounds_t,
                 q=1,
@@ -231,7 +288,9 @@ class MOBoTorchSequentialOptimizer:
         first_new = self.y_obs.shape[0] - y_new.shape[0]
         for k in range(y_new.shape[0]):
             prefix = self.y_obs[: first_new + k + 1]
-            self.hypervolume_history.append(compute_hypervolume(prefix, self.ref_point))
+            self.hypervolume_history.append(
+                compute_hypervolume(prefix, self.ref_point, library=self.model_library)
+            )
 
     def result(self) -> MORunResult:
         """Build run result from current state."""
@@ -239,7 +298,7 @@ class MOBoTorchSequentialOptimizer:
             x_obs=self.x_obs.astype(np.float64),
             y_obs=self.y_obs.astype(np.float64),
             hypervolume_history=np.asarray(self.hypervolume_history, dtype=np.float64),
-            pareto_front=pareto_front(self.y_obs),
+            pareto_front=pareto_front(self.y_obs, library=self.model_library),
         )
 
 
@@ -250,15 +309,23 @@ def run_mobo_botorch(
     n_init: int = 5,
     n_iter: int = 25,
     seed: int | None = 0,
+    model_library: str | None = None,
 ) -> MORunResult:
-    """Run simple BoTorch multi-objective BO (all objectives maximized)."""
+    """Run simple BoTorch multi-objective BO (all objectives maximized); ``model_library``
+    as in ``MOBoTorchConfig``."""
     if n_init <= 0:
         raise ValueError(
             "n_init must be >= 1 for mobo_botorch: at least one random observation is "
             "needed before the first suggest()."
         )
     optimizer = MOBoTorchSequentialOptimizer(
-        MOBoTorchConfig(bounds=bounds, ref_point=ref_point, n_init=n_init, seed=seed)
+        MOBoTorchConfig(
+            bounds=bounds,
+            ref_point=ref_point,
+            n_init=n_init,
+            seed=seed,
+            model_library=model_library,
+        )
     )
     optimizer.bootstrap(objective)
 
