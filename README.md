@@ -671,6 +671,41 @@ CHI '24 Eq. 6, quantile source references) live on `MOTAFConfig`; construct
 a brute-force check that the deterministic source EHVI term equals true hypervolume
 improvement.
 
+### Model library: BoTorch or botorch-rust
+
+The multi-objective optimizers (`mobo_botorch`, `mobo_taf`, `taf_mo_ehvi`) can run on
+[botorch-rust](https://github.com/M-Colley/botorch-rust) (package `botorch_rs`), a Rust
+reimplementation of BoTorch with the same API, instead of BoTorch. The environment
+variable `BO_MODEL_LIBRARY` selects the library **when openbo is imported**:
+
+| `BO_MODEL_LIBRARY` | Library |
+|---|---|
+| unset, empty or `botorch` | BoTorch (the default; unchanged behavior) |
+| `botorch_rs` or `botorch-rust` | botorch-rust |
+| `auto` | botorch-rust if it is installed and complete, otherwise BoTorch |
+
+botorch-rust is used only if it provides everything MO-TAF needs (`PosteriorMeanModel`,
+`StochasticSampler` and the native blend `WeightedLogMeanExp`); otherwise openbo falls back
+to BoTorch and prints why. `openbo.MODEL_LIBRARY` (also in the three modules above) states
+the library actually bound, and `MOBoTorchConfig(model_library=...)` /
+`run_mobo_taf(..., model_library=...)` choose it for one optimizer.
+
+```python
+import os
+os.environ["BO_MODEL_LIBRARY"] = "botorch_rs"   # before importing openbo
+import openbo
+from openbo.optimizers.mobo_taf import run_mobo_taf
+print(openbo.MODEL_LIBRARY)                      # "botorch_rs" (or "botorch" after a fallback)
+```
+
+On botorch-rust the source models are botorch-rust `ModelListGP`s, the blend of the
+target and source terms is computed natively (the same formula as `_CompositeTAFEHVI`), and
+suggestions are seeded through `optimize_acqf(options={"seed": ...})` instead of torch's
+random number generator, so runs are reproducible but do not reproduce BoTorch's
+suggestions bit for bit: both libraries draw their own Monte-Carlo and initialization
+samples. Treat the library as part of a study's design (don't switch it within a study).
+With BoTorch, suggestions are bit-identical to earlier versions of openbo.
+
 ## 6. Server-based Optimization Workflow
 
 Here, we provide the server-based interface for any systems to communicate with our optimizers via WebSockets. With the steps below, you can run the same BO backends **over WebSockets** when your objective lives outside this process (simulator, service, or other language): start a server, speak the JSON ask/tell protocol, and use the included fake client for a quick smoke test. 
