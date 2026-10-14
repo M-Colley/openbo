@@ -627,11 +627,8 @@ def test_fully_decayed_sources_fall_back_to_plain_mobo(tmp_path):
     train_x, train_y, _ = opt._unit_train_tensors()
     model = opt._fit_model(train_x, train_y)
     acq = opt._build_acquisition(model, train_x)
-    from botorch.acquisition.multi_objective.logei import (
-        qLogNoisyExpectedHypervolumeImprovement,
-    )
-
-    assert isinstance(acq, qLogNoisyExpectedHypervolumeImprovement)
+    # The class of the bound model library (BoTorch or botorch-rust).
+    assert isinstance(acq, opt._lib.qLogNoisyExpectedHypervolumeImprovement)
 
 
 def test_warmup_of_one_makes_exactly_the_first_suggestion_source_only(tmp_path):
