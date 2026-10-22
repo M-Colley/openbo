@@ -11,6 +11,11 @@ New to the topic? Read [Background: the key ideas in plain language](#background
 first — the rest of the README assumes those concepts — then jump to
 [Installation and quickstart](#1-installation-and-quickstart).
 
+Select a final Pareto-front design or generate a surrogate front with the new
+[knee-region preference rule and FPBI sampler](docs/decision-making.md).
+The [evidence and limitations](docs/decision-making-evidence.md) include negative
+utility and runtime findings.
+
 ## Background: the key ideas in plain language
 
 Skip this section if you already work with Bayesian optimization.
