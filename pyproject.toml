@@ -1,6 +1,6 @@
 [project]
 name = "open-bo"
-version = "0.1.0"
+version = "0.1.1rc1"
 description = "Research and teaching library for OpenBO"
 readme = "README.md"
 authors = [
